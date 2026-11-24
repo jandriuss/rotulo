@@ -1,0 +1,3 @@
+ffmpeg-core (ffmpeg.wasm 0.12.10) se distribuye bajo GPL-2.0-or-later, porque incluye FFmpeg compilado con x264.
+ffmpeg.wasm (@ffmpeg/ffmpeg 0.12.15) se distribuye bajo licencia MIT.
+Código fuente: https://github.com/ffmpegwasm/ffmpeg.wasm

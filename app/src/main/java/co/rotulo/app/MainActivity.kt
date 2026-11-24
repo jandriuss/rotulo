@@ -114,8 +114,13 @@ class MainActivity : ComponentActivity() {
             ): Boolean {
                 fileCallback?.onReceiveValue(null)
                 fileCallback = callback
+                // Sin filtro de tipo: así aparecen también los .mkv, .avi, .ts, .rmvb, etc. que algunos
+                // teléfonos no marcan como "video". Rótulo decide después si puede abrirlo.
+                val pick = Intent(Intent.ACTION_GET_CONTENT)
+                    .addCategory(Intent.CATEGORY_OPENABLE)
+                    .setType("*/*")
                 return try {
-                    pickFile.launch(params.createIntent())
+                    pickFile.launch(Intent.createChooser(pick, "Elegir video"))
                     true
                 } catch (_: ActivityNotFoundException) {
                     fileCallback = null

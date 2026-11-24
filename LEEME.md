@@ -26,6 +26,16 @@ el primer paso del modelo. Si se equivoca, elige el idioma a mano y genera de nu
 conviene revisarla. «Precisa» entiende mejor, pero es más lenta y pesada; en celulares con poca
 memoria usa «Rápida».
 
+## Formatos de video
+Rótulo abre **cualquier formato** que FFmpeg entienda: MP4, MKV, MOV, WebM, AVI, WMV, FLV, MPG/VOB, TS/M2TS, 3GP, OGV, RMVB, HEVC/H.265, entre otros.
+- Si el reproductor del teléfono abre el archivo, se usa directamente.
+- Si no, Rótulo crea una copia compatible (MP4) solo para ver y editar. Con videos de hasta 4 minutos hace una conversión completa;
+  con videos largos, una versión liviana (solo los cuadros clave y el audio) para que sea rápida. El archivo original no se modifica.
+- El audio para los subtítulos siempre sale del archivo original: primero con el lector de Android y, si no puede
+  (por ejemplo AC3, DTS, WMA o AVI), con FFmpeg.
+- No se pueden abrir archivos protegidos con DRM ni archivos dañados o incompletos.
+- FFmpeg corre dentro de la app (ffmpeg.wasm, carpeta `vendor/ffmpeg-core`, licencia GPL-2.0-or-later).
+
 ## Películas y videos largos
 - La app Android lee el audio **por partes**, directamente del archivo, así que no carga la película en memoria.
 - Puede trabajar **en segundo plano**: sales de la app o apagas la pantalla y sigue, con una notificación que muestra el avance.
@@ -33,7 +43,7 @@ memoria usa «Rápida».
 - Los subtítulos aparecen a medida que se generan. **Pausar** guarda el avance y **Continuar** retoma desde ahí, incluso si cierras la app.
 - Para ver una película, lo práctico es **Descargar .srt** (queda con el mismo nombre del video en Descargas/Rotulo)
   y abrirlo con VLC o MX Player. Quemar los subtítulos en el video tarda lo mismo que dura la película.
-- En el navegador (GitHub Pages) el límite es 30 minutos por video, porque allí sí se carga el audio completo.
+- En el navegador (GitHub Pages) también funciona con videos largos: el audio se lee por partes con FFmpeg.
 - Velocidad: depende del procesador. El motor usa varios núcleos cuando el sistema lo permite;
   la pestaña Subtítulos muestra la velocidad real y el tiempo restante estimado.
 

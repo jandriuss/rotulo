@@ -48,6 +48,8 @@ button{cursor:pointer}
 .empty p{margin:0;color:var(--muted);max-width:340px}
 .empty .mark{width:64px;height:64px;border-radius:18px;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font:800 34px Montserrat,var(--font)}
 .empty small{color:var(--muted);font-size:12px}
+.empty>*{flex:none}
+#convert{overflow-y:auto;justify-content:safe center}
 .dropping .empty{outline:2px dashed var(--accent);outline-offset:-12px}
 .banner{position:absolute;left:10px;right:10px;top:10px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:8px 10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;z-index:2}
 .banner span{flex:1;min-width:160px}
@@ -198,6 +200,14 @@ textarea{resize:vertical;min-height:58px;font-size:16px}
         <button class="btn primary" id="btnOpen2">Elegir video</button>
         <small>El video se procesa en tu dispositivo; no se sube a ningún servidor.</small>
       </div>
+      <div class="empty hidden" id="convert">
+        <div class="mark">R</div>
+        <h2 id="cvTitle">Preparando el video…</h2>
+        <p id="cvText"></p>
+        <div class="bar" style="width:min(320px,80%)"><div id="cvBar"></div></div>
+        <small id="cvPct"></small>
+        <button class="btn" id="cvCancel">Cancelar</button>
+      </div>
       <div class="banner hidden" id="restore"><span id="restoreTxt"></span><button class="btn sm primary" id="restoreYes">Recuperar</button><button class="btn sm" id="restoreNo">Descartar</button></div>
     </div>
     <div class="transport">
@@ -236,7 +246,7 @@ textarea{resize:vertical;min-height:58px;font-size:16px}
   </aside>
 </main>
 
-<input type="file" id="fileInput" accept="video/*" class="hidden">
+<input type="file" id="fileInput" accept="video/*,.mp4,.m4v,.mov,.mkv,.webm,.avi,.wmv,.asf,.flv,.f4v,.mpg,.mpeg,.mpe,.vob,.ts,.m2ts,.mts,.m2t,.tp,.3gp,.3g2,.ogv,.ogg,.divx,.xvid,.rm,.rmvb,.dv,.mxf,.nut,.y4m,.amv,.mjpeg,.qt,.hevc,.h264,.h265,.264,.265" class="hidden">
 <video id="src" class="offscreen" playsinline preload="auto"></video>
 
 <div class="modal hidden" id="exportModal" role="dialog" aria-modal="true" aria-labelledby="expTitle">
@@ -543,17 +553,26 @@ $('#btnOpen').onclick=$('#btnOpen2').onclick=()=>fileInput.click();
 fileInput.onchange=e=>{const f=e.target.files&&e.target.files[0]; if(f)loadFile(f); fileInput.value=''};
 stage.addEventListener('dragover',e=>{e.preventDefault();stage.classList.add('dropping')});
 stage.addEventListener('dragleave',()=>stage.classList.remove('dropping'));
-stage.addEventListener('drop',e=>{e.preventDefault();stage.classList.remove('dropping');const f=[...(e.dataTransfer.files||[])].find(f=>f.type.startsWith('video/'));if(f)loadFile(f)});
+stage.addEventListener('drop',e=>{e.preventDefault();stage.classList.remove('dropping');const f=(e.dataTransfer.files||[])[0];if(f)loadFile(f)});
 
 let pendingRestore=null;
+let loadWatch=0;
 function loadFile(f){
-  if(S.exporting)return;
+  if(S.exporting||S.gen.running)return;
+  cancelConvert(true);
   if(S.url)URL.revokeObjectURL(S.url);
-  S.url=URL.createObjectURL(f); S.file=f; S.name=f.name||'video';
+  S.url=URL.createObjectURL(f); S.file=f; S.name=f.name||'video'; S.compat=null; S.loading='direct';
+  $('#convert').classList.add('hidden');
   video.src=S.url; video.load();
+  clearTimeout(loadWatch);
+  loadWatch=setTimeout(()=>{if(S.loading==='direct')openCompat('el reproductor no respondió')},20000);
 }
 video.addEventListener('loadedmetadata',async()=>{
-  if(!video.videoWidth){toast('Ese archivo no tiene imagen de video.');return}
+  if(!video.videoWidth){
+    if(S.loading==='direct'){openCompat('el reproductor no reconoce la imagen');return}
+    toast('Ese archivo no tiene imagen de video.');return;
+  }
+  clearTimeout(loadWatch); S.loading=null;
   let d=video.duration;
   if(!isFinite(d)){ // algunos WebM no traen duración
     video.currentTime=1e7; await new Promise(r=>video.addEventListener('durationchange',r,{once:true})); d=video.duration; video.currentTime=0;
@@ -568,7 +587,7 @@ video.addEventListener('loadedmetadata',async()=>{
     if(ni||ns){pendingRestore=saved;$('#restoreTxt').textContent=`Hay trabajo guardado de la última vez con este video (${ns} subtítulo(s), ${ni} texto(s) o sticker(s)).`;$('#restore').classList.remove('hidden')}}catch(e){}}
   toast('Video cargado: '+S.vw+'×'+S.vh+', '+fmt(d));
 });
-video.addEventListener('error',()=>{if(S.url)toast('No se pudo abrir ese video en este navegador.')});
+video.addEventListener('error',()=>{if(!S.url)return;if(S.loading==='direct'){openCompat('formato no compatible con el reproductor');return}S.loading=null;toast('No se pudo abrir ese video.')});
 $('#restoreYes').onclick=()=>{if(pendingRestore){applySnap(pendingRestore);if(!S.subStyle)S.subStyle=defaultSubStyle();commit();refreshAll();ensureFonts().then(draw)}$('#restore').classList.add('hidden')};
 $('#restoreNo').onclick=()=>{store.clear();$('#restore').classList.add('hidden')};
 
@@ -905,6 +924,7 @@ function openExport(){
   const ro=resOptions(); if(!ro.find(r=>r.id===expOpts.res))expOpts.res='orig';
   $('#resOpts').innerHTML=ro.map(r=>`<label class="opt"><input type="radio" name="res" value="${r.id}" ${r.id===expOpts.res?'checked':''}> ${r.label}<small>${r.W}×${r.H}</small></label>`).join('');
   $$('#fpsSeg button').forEach(b=>b.classList.toggle('on',+b.dataset.v===expOpts.fps));
+  if(S.compat&&S.compat.lite)$('#expInfo').textContent+=' · Atención: este video se convirtió en versión liviana (solo cuadros clave), así que el video exportado se verá a saltos. Para películas usa «Descargar .srt».';
   showStep('expSetup'); $('#exportModal').classList.remove('hidden');
 }
 function showStep(id){['expSetup','expRun','expDone'].forEach(s=>$('#'+s).classList.toggle('hidden',s!==id))}
@@ -1063,6 +1083,138 @@ if('serviceWorker' in navigator && location.protocol==='https:' && window.top===
 }
 
 
+
+/* ============================================================
+   FORMATOS UNIVERSALES con FFmpeg (ffmpeg.wasm 0.12, incluido en vendor/)
+   - Si el reproductor del teléfono no entiende el archivo (AVI, WMV, FLV, MPG, TS, HEVC…),
+     se crea una copia compatible (MP4/H.264) para ver y editar:
+       · videos de hasta 4 min: conversión completa a 480p;
+       · más largos: versión liviana con solo los cuadros clave (mucho más rápida) y el audio.
+   - El audio para los subtítulos se lee siempre del archivo ORIGINAL, por partes.
+   ============================================================ */
+const FF_LITE_SEC=240;
+let ffInst=null, ffP=null, ffMounted=null, ffIn='', ffOnLog=null; const ffLog=[];
+async function getFF(){
+  if(ffInst)return ffInst;
+  if(!ffP)ffP=(async()=>{
+    const base=new URL('vendor/',location.href).href;
+    let ok=false;try{ok=(await fetch(base+'ffmpeg/index.js',{method:'HEAD',cache:'no-store'})).ok}catch(e){}
+    if(!ok)throw new Error('FFMPEG_NO');
+    const {FFmpeg}=await import(base+'ffmpeg/index.js');
+    const ff=new FFmpeg();
+    ff.on('log',({message})=>{ffLog.push(message);if(ffLog.length>300)ffLog.shift();if(ffOnLog)ffOnLog(message)});
+    await ff.load({coreURL:base+'ffmpeg-core/ffmpeg-core.js',wasmURL:base+'ffmpeg-core/ffmpeg-core.wasm'});
+    glog('FFmpeg cargado');
+    ffInst=ff;return ff;
+  })();
+  try{return await ffP}catch(e){ffP=null;throw e}
+}
+function ffKill(){if(ffInst){try{ffInst.terminate()}catch(e){}}ffInst=null;ffP=null;ffMounted=null}
+async function ffInput(ff){
+  if(ffMounted===S.file)return ffIn;
+  try{await ff.unmount('/in')}catch(e){}
+  try{await ff.createDir('/in')}catch(e){}
+  const ext=((S.file.name||'').match(/\.[a-z0-9]{1,6}$/i)||[''])[0].toLowerCase();
+  const f=new File([S.file],'input'+ext,{type:S.file.type||'application/octet-stream'});
+  await ff.mount('WORKERFS',{files:[f]},'/in');
+  ffMounted=S.file; ffIn='/in/input'+ext; return ffIn;
+}
+async function ffRun(args,onLine){
+  const ff=await getFF();
+  ffOnLog=onLine||null;
+  try{return await ff.exec(args)}finally{ffOnLog=null}
+}
+const hms=t=>{const m=/(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(t);return m?(+m[1]*3600+ +m[2]*60+ +m[3]):0};
+async function ffProbe(){
+  const ff=await getFF(); const IN=await ffInput(ff); const lines=[];
+  await ffRun(['-hide_banner','-i',IN],m=>lines.push(m));
+  const txt=lines.join('\n');
+  const d=/Duration:\s*([\d:.]+)/.exec(txt);
+  const v=/Stream #[^\n]*Video:\s*([^,\s(]+)[^\n]*?,\s*(\d{2,5})x(\d{2,5})/.exec(txt);
+  const a=/Stream #[^\n]*Audio:\s*([^,\s(]+)/.exec(txt);
+  const fmt=/Input #0,\s*([^,\s]+)/.exec(txt);
+  return {dur:d?hms(d[1]):0,vcodec:v&&v[1],w:v?+v[2]:0,h:v?+v[3]:0,acodec:a&&a[1],format:fmt&&fmt[1],raw:txt};
+}
+async function ffProxy(info,onProg){
+  const ff=await getFF(); const IN=await ffInput(ff);
+  const lite=info.dur>FF_LITE_SEC;
+  const args=['-hide_banner','-nostdin','-y'];
+  if(lite)args.push('-skip_frame','nokey');
+  args.push('-i',IN,'-map','0:v:0');
+  if(info.acodec)args.push('-map','0:a:0?');
+  args.push('-vf',(lite?'scale=-2:min(360\\,ih)':'scale=-2:min(480\\,ih)')+',scale=trunc(iw/2)*2:trunc(ih/2)*2');
+  args.push('-c:v','libx264','-preset','ultrafast','-crf',lite?'30':'26','-pix_fmt','yuv420p');
+  if(lite)args.push('-vsync','vfr');
+  if(info.acodec)args.push('-c:a','aac','-b:a',lite?'64k':'128k','-ac','2');else args.push('-an');
+  args.push('-sn','-dn','-movflags','+faststart','/proxy.mp4');
+  const rc=await ffRun(args,m=>{const t=/time=\s*([\d:.]+)/.exec(m);if(t&&info.dur)onProg(clamp(hms(t[1])/info.dur,0,1))});
+  if(rc!==0)throw new Error('la conversión terminó con código '+rc);
+  const data=await ff.readFile('/proxy.mp4'); try{await ff.deleteFile('/proxy.mp4')}catch(e){}
+  return {blob:new Blob([data],{type:'video/mp4'}),lite};
+}
+let convCancelled=false;
+function cancelConvert(silent){if(S.loading==='convert'){convCancelled=true;ffKill();if(!silent)toast('Conversión cancelada')}}
+$('#cvCancel').onclick=()=>{cancelConvert();$('#convert').classList.add('hidden');S.loading=null;if(!S.dur)$('#empty').classList.remove('hidden')};
+async function openCompat(why){
+  if(S.loading!=='direct')return;
+  clearTimeout(loadWatch); S.loading='convert'; convCancelled=false;
+  const name=S.name, ext=((name.match(/\.([a-z0-9]{1,6})$/i)||[])[1]||'').toUpperCase();
+  glog(`apertura directa falló (${why}): ${name} → conversión con FFmpeg`);
+  $('#empty').classList.add('hidden'); const C=$('#convert'); C.classList.remove('hidden');
+  $('#cvTitle').textContent='Preparando '+(ext?'el formato '+ext:'el video')+'…';
+  $('#cvText').textContent='El reproductor del teléfono no abre este formato directamente. Rótulo lo convertirá a una versión compatible; el archivo original no se modifica.';
+  $('#cvBar').style.width='0%'; $('#cvPct').textContent='Cargando el convertidor…';
+  try{
+    const info=await ffProbe();
+    if(convCancelled)return;
+    glog(`formato: ${info.format||'?'} · video: ${info.vcodec||'ninguno'} ${info.w}×${info.h} · audio: ${info.acodec||'ninguno'} · duración ${fmt(info.dur)}`);
+    if(!info.vcodec){
+      throw new Error(info.dur||info.acodec?'Este archivo no tiene imagen de video (parece ser solo audio).':'No se reconoce como video: puede estar dañado, incompleto o protegido (DRM).');
+    }
+    const lite=info.dur>FF_LITE_SEC;
+    $('#cvTitle').textContent=`Convirtiendo ${ext||'el video'} (${info.vcodec}${info.acodec?' + '+info.acodec:''})`;
+    $('#cvText').textContent=lite
+      ?`Video largo (${fmt(info.dur).replace(/\.\d$/,'')}): se crea una versión liviana para ver y ubicar los subtítulos (solo cuadros clave + audio). Los subtítulos se generan con el audio original.`
+      :'Se crea una copia en MP4 para poder verla y editarla. El archivo original no se modifica.';
+    const t0=performance.now();
+    const r=await ffProxy(info,p=>{
+      $('#cvBar').style.width=(p*100).toFixed(1)+'%';
+      const el=(performance.now()-t0)/1000, rem=p>0.02?el*(1-p)/p:0;
+      $('#cvPct').textContent=`${Math.floor(p*100)} %`+(rem?` · faltan ~${rem>90?Math.round(rem/60)+' min':Math.round(rem)+' s'}`:'');
+    });
+    if(convCancelled)return;
+    glog(`conversión lista en ${Math.round((performance.now()-t0)/1000)} s (${(r.blob.size/1048576).toFixed(1)} MB${r.lite?', liviana':''})`);
+    S.compat={lite:r.lite,info:{format:info.format,vcodec:info.vcodec,acodec:info.acodec,w:info.w,h:info.h}};
+    S.loading='proxy';
+    if(S.url)URL.revokeObjectURL(S.url);
+    S.url=URL.createObjectURL(r.blob);
+    video.src=S.url; video.load();
+    C.classList.add('hidden');
+  }catch(e){
+    if(convCancelled)return;
+    S.loading=null; C.classList.add('hidden'); $('#empty').classList.remove('hidden');
+    const m=String(e&&e.message||e);
+    glog('no se pudo convertir: '+m);
+    toast(m==='FFMPEG_NO'?'Este formato necesita el convertidor, que viene en la app Android y en la versión de GitHub Pages.':'No se pudo abrir el video: '+m);
+  }
+}
+/* Audio por partes con FFmpeg desde el archivo original (cualquier formato) */
+class FFmpegSource{
+  constructor(){this.label='FFmpeg (cualquier formato)'}
+  async open(startSec){const ff=await getFF();this.IN=await ffInput(ff);this.t=startSec;return startSec}
+  async read(n){
+    const secs=n/SR; if(this.t>=S.dur+0.5)return new Float32Array(0);
+    const ff=await getFF();
+    await ffRun(['-hide_banner','-nostdin','-y','-ss',this.t.toFixed(3),'-i',this.IN,'-t',secs.toFixed(3),'-map','0:a:0','-vn','-sn','-dn','-ac','1','-ar','16000','-f','s16le','/a.pcm']);
+    let data=new Uint8Array(0);try{data=await ff.readFile('/a.pcm');await ff.deleteFile('/a.pcm')}catch(e){}
+    this.t+=secs;
+    const i16=new Int16Array(data.buffer,data.byteOffset,data.byteLength>>1);
+    if(!i16.length)return this.t<S.dur-0.5?new Float32Array(n):new Float32Array(0);   // tramo sin audio → silencio
+    const f=new Float32Array(i16.length);for(let i=0;i<i16.length;i++)f[i]=i16[i]/32768;return f;
+  }
+  close(){}
+}
+
 /* ============================================================
    SUBTÍTULOS AUTOMÁTICOS (voz → texto → español), en el dispositivo
    Motor: Transformers.js 3.8.1 + Whisper (OpenAI) + Opus-MT en→es (Helsinki-NLP)
@@ -1199,6 +1351,7 @@ function onModelProgress(m){
 /* --- Fuentes de audio (16 kHz mono) --- */
 function nativeAudioOk(){return !!(S.file&&andr('nativeAudioFor',S.file.name||'',S.file.size||-1))}
 class NativeSource{              // App Android: MediaExtractor + MediaCodec, por partes
+  constructor(){this.label='lector nativo de Android'}
   async open(startSec){
     const r=await fetch('/pcm/open/'+Math.round(startSec*1000),{cache:'no-store'});
     const j=await r.json(); if(!j.ok)throw new Error(j.error||'no se pudo leer el audio');
@@ -1215,6 +1368,7 @@ class NativeSource{              // App Android: MediaExtractor + MediaCodec, po
   close(){fetch('/pcm/close',{cache:'no-store'}).catch(()=>{})}
 }
 class MemorySource{              // Navegador: decodeAudioData del archivo completo (videos cortos)
+  constructor(){this.label='decodificador del navegador'}
   async open(startSec){
     setGen('Extrayendo el audio del video…');
     this.buf=await extractAudio(); this.i=Math.floor(startSec*SR); return startSec;
@@ -1331,6 +1485,7 @@ function updGenUI(){
 function friendlyErr(e){
   const m=String(e&&e.message||e);
   if(/cancelado/.test(m))return null;
+  if(m==='FFMPEG_NO')return 'Este video necesita el convertidor FFmpeg para leer el audio, que viene en la app Android y en la versión de GitHub Pages (no dentro de claude.ai).';
   if(m==='LARGO')return `En el navegador solo se pueden procesar videos de hasta ${WEB_MAX_SEC/60} minutos, porque el audio completo se carga en memoria. Para películas y videos largos usa la app Android: lee el audio por partes y puede trabajar en segundo plano.`;
   if(/fetch|network|Failed to load|import|cargar el motor|NetworkError|CORS|Load failed|sin conexión/i.test(m))
     return 'No se pudieron descargar los modelos de IA. Revisa la conexión a internet (la primera vez se necesitan). Si estás abriendo Rótulo dentro de claude.ai, esta función no puede descargar modelos ahí: úsala en la app Android o en tu versión publicada en GitHub Pages. Detalle: '+m;
@@ -1357,11 +1512,17 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
   let src=null,lastNotify=0,paused=false;
   const notify=()=>{const now=Date.now();if(now-lastNotify<3000)return;lastNotify=now;andr('workUpdate',`${fmt(S.gen.cursor).replace(/\.\d$/,'')} de ${fmt(S.dur).replace(/\.\d$/,'')} · ${S.subs.length} subtítulos`,Math.round((S.gen.p||0)*100))};
   try{
-    const native=nativeAudioOk();
-    glog(native?'audio: lector nativo de Android (por partes)':'audio: decodificador del navegador (archivo completo)');
-    if(!native&&S.dur>WEB_MAX_SEC)throw new Error('LARGO');
-    src=native?new NativeSource():new MemorySource();
-    const realStart=await src.open(startSec);
+    const chain=[];
+    if(nativeAudioOk())chain.push(()=>new NativeSource());
+    if(!S.compat&&S.dur<=WEB_MAX_SEC)chain.push(()=>new MemorySource());
+    chain.push(()=>new FFmpegSource());
+    let realStart=startSec,lastErr=null;
+    for(const mk of chain){
+      const s=mk();
+      try{realStart=await s.open(startSec);src=s;glog('audio: '+s.label);break}
+      catch(e){lastErr=e;glog(`audio: ${s.label} no sirvió (${e.message})`);try{s.close()}catch(_){}}
+    }
+    if(!src)throw (lastErr&&lastErr.message==='FFMPEG_NO'&&S.dur>WEB_MAX_SEC)?new Error('LARGO'):(lastErr||new Error('no se pudo leer el audio'));
     const win=new Windower(src,realStart);
     const model=ASR_MODELS[o.q]||ASR_MODELS.base;
     let lang=S.gen.lang||(o.src==='auto'?null:o.src);
@@ -1422,6 +1583,7 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
     const msg=friendlyErr(e); paused=!msg;
     const cur=S.gen.cursor||0, keep=S.subs.length;
     glog((paused?'pausado en ':'error en ')+fmt(cur)+(msg?': '+e.message:''));
+    if(msg&&ffLog.length)glog('FFmpeg (últimas líneas):\n'+ffLog.slice(-8).join('\n'));
     if(keep){S.gen.cursor=cur;saveProgress()}
     S.gen={running:false,error:msg,paused:paused&&keep?{cursor:cur,n:keep}:null};
     if(keep)commit();
@@ -1477,7 +1639,7 @@ function renderSubsTab(){
     <label class="fld grow"><span>Subtítulos en</span><select data-go="tgt"><option value="es" ${o.tgt==='es'?'selected':''}>Español (traducir)</option><option value="same" ${o.tgt==='same'?'selected':''}>El idioma del video (sin traducir)</option></select></label></div>
     <div class="fld"><span>Precisión</span><div class="seg"><button data-gq="base" class="${o.q==='base'?'on':''}">Rápida</button><button data-gq="small" class="${o.q==='small'?'on':''}">Precisa</button></div></div>
     <p class="note">La primera vez se descargan los modelos de IA: unos 150 MB en «Rápida» o unos 350 MB en «Precisa» (aproximado; usa wifi). Después quedan guardados en el dispositivo.</p>`;
-    if(S.dur>WEB_MAX_SEC&&!nativeAudioOk())h+=`<div class="warn">Este video dura ${fmt(S.dur).replace(/\.\d$/,'')}. ${isAndroid?'Ábrelo con el botón «Abrir video» de la app para que pueda leer el audio por partes.':`En el navegador el máximo es ${WEB_MAX_SEC/60} minutos; para películas usa la app Android.`}</div>`;
+    if(false)h+=`<div class="warn">Este video dura ${fmt(S.dur).replace(/\.\d$/,'')}. ${isAndroid?'Ábrelo con el botón «Abrir video» de la app para que pueda leer el audio por partes.':`En el navegador el máximo es ${WEB_MAX_SEC/60} minutos; para películas usa la app Android.`}</div>`;
     if(prog&&prog.cursor<S.dur-1){
       h+=`<div class="warn">Quedó un proceso en pausa en ${fmt(prog.cursor).replace(/\.\d$/,'')} de ${fmt(S.dur).replace(/\.\d$/,'')} (${prog.subs.length} subtítulos).</div>
       <div class="row" style="margin-top:8px"><button class="btn primary" data-sa="resume">Continuar</button><button class="btn" data-sa="gen">Empezar de nuevo</button></div>`;
@@ -1581,7 +1743,7 @@ if(window.RotuloAndroid)setTimeout(()=>window.__rotuloShared(),300);
 
 /* ---------- Inicio ---------- */
 S.subStyle=defaultSubStyle(); renderStickers(); renderEditor(); renderSubsTab(); renderTimeline(); layout(); setPlayIcon();
-window.__rotulo={S,addText,addSticker,exportVideo,commit,buildSrt,splitWindows,generateSubs}; // para pruebas
+window.__rotulo={ffProbe,S,addText,addSticker,exportVideo,commit,buildSrt,splitWindows,generateSubs}; // para pruebas
 </script>
 </body>
 </html>
