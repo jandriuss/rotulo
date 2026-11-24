@@ -15,7 +15,7 @@ títulos y stickers y exportar el video con todo incluido. El proyecto trae dos 
 3. **Opus-MT en→es** (Helsinki-NLP) traduce del inglés al español.
 4. Revisas y corriges los subtítulos, ajustas la sincronía y el estilo, y exportas el video o el archivo `.srt`.
 
-Todo corre en el teléfono mediante Transformers.js 3.8.1, con WebAssembly. La primera vez se descargan
+Todo corre en el teléfono mediante Transformers.js 3.8.1, con WebAssembly. El motor viene incluido en la app (carpeta `vendor/`); solo los modelos se descargan. La primera vez se descargan
 los modelos desde Hugging Face: aproximadamente 150 MB en precisión «Rápida» (whisper-base) y
 350 MB en «Precisa» (whisper-small). Luego quedan guardados en el dispositivo.
 
@@ -25,6 +25,17 @@ el primer paso del modelo. Si se equivoca, elige el idioma a mano y genera de nu
 **Calidad:** en idiomas distintos al inglés la traducción pasa por el inglés (dos pasos), así que
 conviene revisarla. «Precisa» entiende mejor, pero es más lenta y pesada; en celulares con poca
 memoria usa «Rápida».
+
+## Películas y videos largos
+- La app Android lee el audio **por partes**, directamente del archivo, así que no carga la película en memoria.
+- Puede trabajar **en segundo plano**: sales de la app o apagas la pantalla y sigue, con una notificación que muestra el avance.
+  Si el teléfono la detiene, toca «Permitir sin restricciones de batería» en la pestaña Subtítulos.
+- Los subtítulos aparecen a medida que se generan. **Pausar** guarda el avance y **Continuar** retoma desde ahí, incluso si cierras la app.
+- Para ver una película, lo práctico es **Descargar .srt** (queda con el mismo nombre del video en Descargas/Rotulo)
+  y abrirlo con VLC o MX Player. Quemar los subtítulos en el video tarda lo mismo que dura la película.
+- En el navegador (GitHub Pages) el límite es 30 minutos por video, porque allí sí se carga el audio completo.
+- Velocidad: depende del procesador. El motor usa varios núcleos cuando el sistema lo permite;
+  la pestaña Subtítulos muestra la velocidad real y el tiempo restante estimado.
 
 ## Opción A: todo desde el celular con GitHub (gratis)
 1. Crea una cuenta en github.com y un repositorio nuevo, por ejemplo `rotulo` (público).

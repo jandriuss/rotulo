@@ -4,6 +4,8 @@ import android.content.ContentValues
 import android.content.Intent
 import android.net.Uri
 import android.os.Environment
+import android.os.PowerManager
+import android.provider.Settings
 import android.provider.MediaStore
 import android.util.Base64
 import android.view.WindowManager
@@ -105,6 +107,57 @@ class RotuloBridge(private val activity: MainActivity) {
             }
         }
     } catch (_: Exception) { "" }
+
+    // --- Audio nativo por partes ---
+    /** true si el video abierto en la web es el mismo que la app puede leer de forma nativa. */
+    @JavascriptInterface
+    fun nativeAudioFor(name: String, size: Double): Boolean {
+        if (activity.currentUri == null) return false
+        val sameName = activity.currentName.isNotBlank() && activity.currentName == name
+        val sameSize = activity.currentSize > 0 && activity.currentSize == size.toLong()
+        return sameName || sameSize
+    }
+
+    // --- Trabajo en segundo plano ---
+    @JavascriptInterface
+    fun workStart(title: String) {
+        activity.requestNotificationPermission()
+        activity.runOnUiThread {
+            try {
+                activity.startForegroundService(Intent(activity, WorkService::class.java).putExtra("title", title))
+            } catch (_: Exception) { }
+        }
+    }
+
+    @JavascriptInterface
+    fun workUpdate(text: String, percent: Int) {
+        try { WorkService.update(activity, text, percent) } catch (_: Exception) { }
+    }
+
+    @JavascriptInterface
+    fun workEnd(text: String, ok: Boolean) {
+        try { activity.stopService(Intent(activity, WorkService::class.java)) } catch (_: Exception) { }
+        try { WorkService.finished(activity, text) } catch (_: Exception) { }
+    }
+
+    /** true si Android puede restringir la app en segundo plano por ahorro de batería. */
+    @JavascriptInterface
+    fun batteryRestricted(): Boolean = try {
+        !activity.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(activity.packageName)
+    } catch (_: Exception) { false }
+
+    @JavascriptInterface
+    fun openBatterySettings() {
+        activity.runOnUiThread {
+            try {
+                activity.startActivity(
+                    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + activity.packageName))
+                )
+            } catch (_: Exception) {
+                try { activity.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) } catch (_: Exception) { }
+            }
+        }
+    }
 
     // --- Video recibido desde "Compartir" ---
     @JavascriptInterface fun hasShared(): Boolean = activity.sharedUri != null

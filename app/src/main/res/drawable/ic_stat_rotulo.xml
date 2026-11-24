@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Ícono de notificación (monocromo) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="512" android:viewportHeight="512">
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M178,382V130h96c58,0 92,30 92,78 0,34 -18,58 -48,70l58,104h-62l-50,-94h-30v94zM234,240h36c26,0 40,-11 40,-32s-14,-32 -40,-32h-36z" />
+</vector>
