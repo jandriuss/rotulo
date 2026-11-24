@@ -1,0 +1,1 @@
+-keepclassmembers class co.rotulo.app.RotuloBridge { @android.webkit.JavascriptInterface <methods>; }

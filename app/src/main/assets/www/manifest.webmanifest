@@ -1,0 +1,17 @@
+{
+  "name": "Rótulo – subtítulos automáticos traducidos",
+  "short_name": "Rótulo",
+  "description": "Genera subtítulos automáticos traducidos al español y agrega textos y stickers a tus videos, desde el celular.",
+  "lang": "es",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f1013",
+  "theme_color": "#0f1013",
+  "icons": [
+    {"src": "icon-192.png", "sizes": "192x192", "type": "image/png"},
+    {"src": "icon-512.png", "sizes": "512x512", "type": "image/png"},
+    {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ]
+}
