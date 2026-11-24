@@ -1,10 +1,13 @@
 # Compila el APK automáticamente en GitHub (no necesitas computador ni Android Studio).
-# Pestaña "Actions" del repositorio → "Compilar APK" → Run workflow → al terminar, descarga "Rotulo-apk".
+# Cada vez que se sube un cambio a main, el APK nuevo queda en:
+#   https://github.com/<usuario>/rotulo/releases/latest/download/Rotulo.apk
 name: Compilar APK
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,7 +22,18 @@ jobs:
           gradle-version: '8.9'
       - name: Compilar APK de depuración
         run: gradle assembleDebug --no-daemon
+      - name: Renombrar APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk Rotulo.apk
       - uses: actions/upload-artifact@v4
         with:
           name: Rotulo-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: Rotulo.apk
+      - name: Publicar en Releases (enlace directo para el celular)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" Rotulo.apk \
+            --title "Rótulo (compilación ${{ github.run_number }})" \
+            --notes "APK de prueba compilado automáticamente desde el commit ${{ github.sha }}." \
+            --latest
