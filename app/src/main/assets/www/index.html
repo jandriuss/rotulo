@@ -198,6 +198,7 @@ textarea{resize:vertical;min-height:58px;font-size:16px}
         <h2>Abre un video para empezar</h2>
         <p>Rótulo escucha el video, crea los subtítulos y los traduce al español. También puedes agregar títulos y stickers.</p>
         <button class="btn primary" id="btnOpen2">Elegir video</button>
+        <button class="btn" id="btnDl2">Descargar de internet</button>
         <small>El video se procesa en tu dispositivo; no se sube a ningún servidor.</small>
       </div>
       <div class="empty hidden" id="convert">
@@ -232,6 +233,7 @@ textarea{resize:vertical;min-height:58px;font-size:16px}
       <button data-tab="texto" role="tab">Texto</button>
       <button data-tab="sticker" role="tab">Stickers</button>
       <button data-tab="editar" role="tab">Editar</button>
+      <button data-tab="dl" role="tab">Descargar</button>
     </nav>
     <div class="tab on" id="tab-subs"><div id="subsPanel"></div></div>
     <div class="tab" id="tab-texto">
@@ -243,6 +245,7 @@ textarea{resize:vertical;min-height:58px;font-size:16px}
       <div id="stickerGrid"></div>
     </div>
     <div class="tab" id="tab-editar"><div id="editor"></div></div>
+    <div class="tab" id="tab-dl"><div id="dlPanel"></div></div>
   </aside>
 </main>
 
@@ -585,7 +588,8 @@ video.addEventListener('loadedmetadata',async()=>{
   pendingRestore=null; $('#restore').classList.add('hidden');
   if(saved){try{const o=JSON.parse(saved);const ni=Array.isArray(o)?o.length:(o.items||[]).length, ns=Array.isArray(o)?0:(o.subs||[]).length;
     if(ni||ns){pendingRestore=saved;$('#restoreTxt').textContent=`Hay trabajo guardado de la última vez con este video (${ns} subtítulo(s), ${ni} texto(s) o sticker(s)).`;$('#restore').classList.remove('hidden')}}catch(e){}}
-  toast('Video cargado: '+S.vw+'×'+S.vh+', '+fmt(d));
+  if(S.compat&&S.compat.placeholder)toast('Modo solo subtítulos: genera los subtítulos y descarga el .srt');else toast('Video cargado: '+S.vw+'×'+S.vh+', '+fmt(d));
+  if(S.afterOpen){showTab(S.afterOpen);S.afterOpen=null}
 });
 video.addEventListener('error',()=>{if(!S.url)return;if(S.loading==='direct'){openCompat('formato no compatible con el reproductor');return}S.loading=null;toast('No se pudo abrir ese video.')});
 $('#restoreYes').onclick=()=>{if(pendingRestore){applySnap(pendingRestore);if(!S.subStyle)S.subStyle=defaultSubStyle();commit();refreshAll();ensureFonts().then(draw)}$('#restore').classList.add('hidden')};
@@ -646,6 +650,7 @@ function showTab(n){
   $$('.tab').forEach(t=>t.classList.toggle('on',t.id==='tab-'+n));
   if(n!=='sticker') replacingSticker=false;
   if(n==='subs') renderSubsTab();
+  if(n==='dl') renderDl();
 }
 $('.tabs').onclick=e=>{const b=e.target.closest('[data-tab]');if(b)showTab(b.dataset.tab)};
 
@@ -917,6 +922,7 @@ function resOptions(){
 let expOpts={res:'orig',fps:30};
 function openExport(){
   if(!S.url||S.exporting)return;
+  if(S.compat&&S.compat.placeholder){toast('En modo solo subtítulos no hay video para exportar: usa «Descargar .srt» en la pestaña Subtítulos');showTab('subs');return}
   video.pause();
   if(!window.MediaRecorder||!HTMLCanvasElement.prototype.captureStream){toast('Este navegador no permite exportar video. Prueba con Chrome.');return}
   const mime=pickMime(true);
@@ -1124,10 +1130,38 @@ async function ffRun(args,onLine){
   ffOnLog=onLine||null;
   try{return await ff.exec(args)}finally{ffOnLog=null}
 }
+/* --- FFmpeg unificado: NATIVO en la app Android (rápido) o wasm en el navegador ---
+   Los argumentos usan '{IN}' para el video original y '@out/nombre' para archivos de salida. */
+const nativeFF=()=>!!andr('ffReady');
+async function ffExec(args,onLine){
+  if(nativeFF()){
+    const id=andr('ffStart',JSON.stringify(args));
+    if(!id)throw new Error('no se pudo iniciar FFmpeg nativo');
+    S.ffJob=id; let seen=0;
+    try{
+      while(true){
+        await sleep(350);
+        let st={};try{st=JSON.parse(andr('ffStatus',id)||'{}')}catch(e){}
+        const tail=st.tail||[], n=st.n||0;
+        if(onLine&&n>seen){const fresh=tail.slice(-Math.min(tail.length,n-seen));fresh.forEach(onLine)}
+        seen=n;
+        if(st.done){if(st.cancelled)throw new Error('cancelado');return st.rc}
+      }
+    }finally{S.ffJob=null}
+  }
+  const ff=await getFF(); const IN=await ffInput(ff);
+  return ffRun(args.map(x=>x==='{IN}'?IN:(typeof x==='string'&&x.startsWith('@out/'))?'/'+x.slice(5):x),onLine);
+}
+async function ffRead(name){
+  if(nativeFF()){const r=await fetch('/ff/out/'+name,{cache:'no-store'});if(!r.ok)throw new Error('FFmpeg no produjo '+name);return await r.blob()}
+  const ff=await getFF(); const d=await ff.readFile('/'+name); try{await ff.deleteFile('/'+name)}catch(e){}
+  return new Blob([d]);
+}
+function ffCancelAll(){if(S.ffJob)andr('ffCancel',S.ffJob);ffKill()}
 const hms=t=>{const m=/(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(t);return m?(+m[1]*3600+ +m[2]*60+ +m[3]):0};
 async function ffProbe(){
-  const ff=await getFF(); const IN=await ffInput(ff); const lines=[];
-  await ffRun(['-hide_banner','-i',IN],m=>lines.push(m));
+  const lines=[];
+  await ffExec(['-hide_banner','-i','{IN}'],m=>lines.push(m));
   const txt=lines.join('\n');
   const d=/Duration:\s*([\d:.]+)/.exec(txt);
   const v=/Stream #[^\n]*Video:\s*([^,\s(]+)[^\n]*?,\s*(\d{2,5})x(\d{2,5})/.exec(txt);
@@ -1135,72 +1169,98 @@ async function ffProbe(){
   const fmt=/Input #0,\s*([^,\s]+)/.exec(txt);
   return {dur:d?hms(d[1]):0,vcodec:v&&v[1],w:v?+v[2]:0,h:v?+v[3]:0,acodec:a&&a[1],format:fmt&&fmt[1],raw:txt};
 }
+/* Conversión completa (videos cortos) */
 async function ffProxy(info,onProg){
-  const ff=await getFF(); const IN=await ffInput(ff);
-  const lite=info.dur>FF_LITE_SEC;
-  const args=['-hide_banner','-nostdin','-y'];
-  if(lite)args.push('-skip_frame','nokey');
-  args.push('-i',IN,'-map','0:v:0');
+  const args=['-hide_banner','-nostdin','-y','-i','{IN}','-map','0:v:0'];
   if(info.acodec)args.push('-map','0:a:0?');
-  args.push('-vf',(lite?'scale=-2:min(360\\,ih)':'scale=-2:min(480\\,ih)')+',scale=trunc(iw/2)*2:trunc(ih/2)*2');
-  args.push('-c:v','libx264','-preset','ultrafast','-crf',lite?'30':'26','-pix_fmt','yuv420p');
-  if(lite)args.push('-vsync','vfr');
-  if(info.acodec)args.push('-c:a','aac','-b:a',lite?'64k':'128k','-ac','2');else args.push('-an');
-  args.push('-sn','-dn','-movflags','+faststart','/proxy.mp4');
-  const rc=await ffRun(args,m=>{const t=/time=\s*([\d:.]+)/.exec(m);if(t&&info.dur)onProg(clamp(hms(t[1])/info.dur,0,1))});
+  args.push('-vf','scale=-2:min(480\\,ih),scale=trunc(iw/2)*2:trunc(ih/2)*2','-c:v','libx264','-preset','ultrafast','-crf','26','-pix_fmt','yuv420p');
+  if(info.acodec)args.push('-c:a','aac','-b:a','128k','-ac','2');else args.push('-an');
+  args.push('-sn','-dn','-movflags','+faststart','@out/proxy.mp4');
+  const rc=await ffExec(args,m=>{const t=/time=\s*([\d:.]+)/.exec(m);if(t&&info.dur)onProg(clamp(hms(t[1])/info.dur,0,1))});
   if(rc!==0)throw new Error('la conversión terminó con código '+rc);
-  const data=await ff.readFile('/proxy.mp4'); try{await ff.deleteFile('/proxy.mp4')}catch(e){}
-  return {blob:new Blob([data],{type:'video/mp4'}),lite};
+  return await ffRead('proxy.mp4');
+}
+/* Modo solo subtítulos (videos largos): sin convertir; una imagen fija con la duración exacta */
+async function ffPlaceholder(info){
+  let H=180,W=320;
+  if(info.w&&info.h){W=Math.max(2,Math.round(H*info.w/info.h/2)*2)}
+  const dur=Math.max(1,info.dur).toFixed(2);
+  let rc=1;
+  try{rc=await ffExec(['-hide_banner','-nostdin','-y','-ss',String(Math.min(info.dur*0.15,120).toFixed(1)),'-i','{IN}','-frames:v','1','-vf',`scale=${W}:${H}`,'@out/poster.jpg'])}catch(e){if(/cancelado/.test(e.message))throw e}
+  const src=rc===0?['-loop','1','-framerate','0.2','-i','@out/poster.jpg']:['-f','lavfi','-i',`color=c=0x15171b:s=${W}x${H}:r=0.2:d=${dur}`];
+  glog(rc===0?'modo solo subtítulos: imagen tomada del video':'modo solo subtítulos: imagen neutra');
+  const rc2=await ffExec(['-hide_banner','-nostdin','-y',...src,'-t',dur,'-c:v','libx264','-preset','ultrafast','-tune','stillimage','-pix_fmt','yuv420p','-movflags','+faststart','@out/placeholder.mp4']);
+  if(rc2!==0)throw new Error('no se pudo preparar la vista (código '+rc2+')');
+  return await ffRead('placeholder.mp4');
 }
 let convCancelled=false;
-function cancelConvert(silent){if(S.loading==='convert'){convCancelled=true;ffKill();if(!silent)toast('Conversión cancelada')}}
+function cancelConvert(silent){if(S.loading==='convert'){convCancelled=true;ffCancelAll();if(!silent)toast('Cancelado')}}
 $('#cvCancel').onclick=()=>{cancelConvert();$('#convert').classList.add('hidden');S.loading=null;if(!S.dur)$('#empty').classList.remove('hidden')};
 async function openCompat(why){
   if(S.loading!=='direct')return;
   clearTimeout(loadWatch); S.loading='convert'; convCancelled=false;
   const name=S.name, ext=((name.match(/\.([a-z0-9]{1,6})$/i)||[])[1]||'').toUpperCase();
-  glog(`apertura directa falló (${why}): ${name} → conversión con FFmpeg`);
+  glog(`apertura directa falló (${why}): ${name} → FFmpeg ${nativeFF()?'nativo':'wasm'}`);
   $('#empty').classList.add('hidden'); const C=$('#convert'); C.classList.remove('hidden');
-  $('#cvTitle').textContent='Preparando '+(ext?'el formato '+ext:'el video')+'…';
-  $('#cvText').textContent='El reproductor del teléfono no abre este formato directamente. Rótulo lo convertirá a una versión compatible; el archivo original no se modifica.';
-  $('#cvBar').style.width='0%'; $('#cvPct').textContent='Cargando el convertidor…';
+  $('#cvTitle').textContent='Analizando '+(ext?'el formato '+ext:'el video')+'…';
+  $('#cvText').textContent='El reproductor del teléfono no abre este formato directamente. El archivo original no se modifica.';
+  $('#cvBar').style.width='0%'; $('#cvPct').textContent=nativeFF()?'':'Cargando el convertidor…';
   try{
     const info=await ffProbe();
     if(convCancelled)return;
     glog(`formato: ${info.format||'?'} · video: ${info.vcodec||'ninguno'} ${info.w}×${info.h} · audio: ${info.acodec||'ninguno'} · duración ${fmt(info.dur)}`);
-    if(!info.vcodec){
-      throw new Error(info.dur||info.acodec?'Este archivo no tiene imagen de video (parece ser solo audio).':'No se reconoce como video: puede estar dañado, incompleto o protegido (DRM).');
+    if(!info.vcodec)throw new Error(info.dur||info.acodec?'Este archivo no tiene imagen de video (parece ser solo audio).':'No se reconoce como video: puede estar dañado, incompleto o protegido (DRM).');
+    const long=info.dur>FF_LITE_SEC; let blob;
+    if(long){
+      $('#cvTitle').textContent='Modo solo subtítulos';
+      $('#cvText').textContent=`Video largo (${fmt(info.dur).replace(/\.\d$/,'')}) en un formato que el teléfono no reproduce. Para no esperar una conversión, verás una imagen fija y los subtítulos se generarán directo del audio original.`;
+      $('#cvPct').textContent='Preparando…';
+      blob=await ffPlaceholder(info);
+    }else{
+      $('#cvTitle').textContent=`Convirtiendo ${ext||'el video'} (${info.vcodec}${info.acodec?' + '+info.acodec:''})`;
+      $('#cvText').textContent='Se crea una copia en MP4 para poder verla y editarla. El archivo original no se modifica.';
+      const t0=performance.now();
+      blob=await ffProxy(info,p=>{
+        $('#cvBar').style.width=(p*100).toFixed(1)+'%';
+        const el=(performance.now()-t0)/1000, rem=p>0.02?el*(1-p)/p:0;
+        $('#cvPct').textContent=`${Math.floor(p*100)} %`+(rem?` · faltan ~${rem>90?Math.round(rem/60)+' min':Math.round(rem)+' s'}`:'');
+      });
+      glog(`conversión lista en ${Math.round((performance.now()-t0)/1000)} s (${(blob.size/1048576).toFixed(1)} MB)`);
     }
-    const lite=info.dur>FF_LITE_SEC;
-    $('#cvTitle').textContent=`Convirtiendo ${ext||'el video'} (${info.vcodec}${info.acodec?' + '+info.acodec:''})`;
-    $('#cvText').textContent=lite
-      ?`Video largo (${fmt(info.dur).replace(/\.\d$/,'')}): se crea una versión liviana para ver y ubicar los subtítulos (solo cuadros clave + audio). Los subtítulos se generan con el audio original.`
-      :'Se crea una copia en MP4 para poder verla y editarla. El archivo original no se modifica.';
-    const t0=performance.now();
-    const r=await ffProxy(info,p=>{
-      $('#cvBar').style.width=(p*100).toFixed(1)+'%';
-      const el=(performance.now()-t0)/1000, rem=p>0.02?el*(1-p)/p:0;
-      $('#cvPct').textContent=`${Math.floor(p*100)} %`+(rem?` · faltan ~${rem>90?Math.round(rem/60)+' min':Math.round(rem)+' s'}`:'');
-    });
     if(convCancelled)return;
-    glog(`conversión lista en ${Math.round((performance.now()-t0)/1000)} s (${(r.blob.size/1048576).toFixed(1)} MB${r.lite?', liviana':''})`);
-    S.compat={lite:r.lite,info:{format:info.format,vcodec:info.vcodec,acodec:info.acodec,w:info.w,h:info.h}};
+    S.compat={placeholder:long,lite:false,info:{format:info.format,vcodec:info.vcodec,acodec:info.acodec,w:info.w,h:info.h}};
+    if(long)S.afterOpen='subs';
     S.loading='proxy';
     if(S.url)URL.revokeObjectURL(S.url);
-    S.url=URL.createObjectURL(r.blob);
+    S.url=URL.createObjectURL(new Blob([blob],{type:'video/mp4'}));
     video.src=S.url; video.load();
     C.classList.add('hidden');
   }catch(e){
     if(convCancelled)return;
     S.loading=null; C.classList.add('hidden'); $('#empty').classList.remove('hidden');
     const m=String(e&&e.message||e);
-    glog('no se pudo convertir: '+m);
+    glog('no se pudo abrir: '+m+(ffLog.length?'\nFFmpeg: '+ffLog.slice(-5).join(' | '):''));
     toast(m==='FFMPEG_NO'?'Este formato necesita el convertidor, que viene en la app Android y en la versión de GitHub Pages.':'No se pudo abrir el video: '+m);
   }
 }
-/* Audio por partes con FFmpeg desde el archivo original (cualquier formato) */
+/* Audio por partes con el FFmpeg NATIVO de Android (cualquier formato, rápido) */
+class NativeFfSource{
+  constructor(){this.label='FFmpeg nativo de Android'}
+  async open(startSec){if(!nativeFF())throw new Error('FFmpeg nativo no disponible');this.t=startSec;return startSec}
+  async read(n){
+    const secs=n/SR; if(this.t>=S.dur+0.5)return new Float32Array(0);
+    const r=await fetch(`/ff/pcm/${Math.round(this.t*1000)}/${Math.round(secs*1000)}`,{cache:'no-store'});
+    if(!r.ok)throw new Error('FFmpeg nativo: HTTP '+r.status);
+    const buf=await r.arrayBuffer(); this.t+=secs;
+    const i16=new Int16Array(buf,0,buf.byteLength>>1);
+    if(!i16.length)return this.t<S.dur-0.5?new Float32Array(n):new Float32Array(0);
+    const f=new Float32Array(i16.length);for(let i=0;i<i16.length;i++)f[i]=i16[i]/32768;return f;
+  }
+  close(){}
+}
+/* Audio por partes con FFmpeg wasm desde el archivo original (navegador) */
 class FFmpegSource{
-  constructor(){this.label='FFmpeg (cualquier formato)'}
+  constructor(){this.label='FFmpeg del navegador (cualquier formato)'}
   async open(startSec){const ff=await getFF();this.IN=await ffInput(ff);this.t=startSec;return startSec}
   async read(n){
     const secs=n/SR; if(this.t>=S.dur+0.5)return new Float32Array(0);
@@ -1514,8 +1574,9 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
   try{
     const chain=[];
     if(nativeAudioOk())chain.push(()=>new NativeSource());
+    if(nativeAudioOk()&&nativeFF())chain.push(()=>new NativeFfSource());
     if(!S.compat&&S.dur<=WEB_MAX_SEC)chain.push(()=>new MemorySource());
-    chain.push(()=>new FFmpegSource());
+    if(!nativeFF())chain.push(()=>new FFmpegSource());
     let realStart=startSec,lastErr=null;
     for(const mk of chain){
       const s=mk();
@@ -1635,6 +1696,7 @@ function renderSubsTab(){
       <button class="btn" data-sa="cancel">Pausar</button></div>`;
   }else{
     h+=`<p class="note">Escucha el video, escribe lo que se dice y lo traduce. Se procesa en tu dispositivo; el video no se sube a ningún servidor.</p>
+    ${S.compat&&S.compat.placeholder?'<div class="warn" style="margin-bottom:10px">Modo solo subtítulos: este formato no se puede reproducir en el teléfono, así que verás una imagen fija. Los subtítulos salen del audio original; al terminar usa «Descargar .srt» y ábrelo con la película en VLC o MX Player.</div>':''}
     <div class="row"><label class="fld grow"><span>Idioma del video</span><select data-go="src">${Object.entries(LANGS).map(([k,v])=>`<option value="${k}" ${k===o.src?'selected':''}>${v}</option>`).join('')}</select></label>
     <label class="fld grow"><span>Subtítulos en</span><select data-go="tgt"><option value="es" ${o.tgt==='es'?'selected':''}>Español (traducir)</option><option value="same" ${o.tgt==='same'?'selected':''}>El idioma del video (sin traducir)</option></select></label></div>
     <div class="fld"><span>Precisión</span><div class="seg"><button data-gq="base" class="${o.q==='base'?'on':''}">Rápida</button><button data-gq="small" class="${o.q==='small'?'on':''}">Precisa</button></div></div>
@@ -1729,6 +1791,89 @@ SP.addEventListener('change',e=>{
   if(el.dataset.cue!=null||el.dataset.sk)commit();
 });
 
+/* ============================================================
+   DESCARGAR VIDEOS (solo app Android) — yt-dlp a través de youtubedl-android,
+   la misma base que usa Seal. Se pide MP4 con H.264 cuando existe, para que el
+   video abra directo en Rótulo sin necesidad de convertir.
+   ============================================================ */
+const DL={opts:{kind:'video',q:'720'},jobs:{},order:[],engine:null,url:''};
+const DLQ=[['360','360p'],['480','480p'],['720','720p'],['1080','1080p'],['max','Máxima']];
+function dlEngine(){try{DL.engine=JSON.parse(andr('dlEngine')||'null')}catch(e){DL.engine=null}return DL.engine}
+function dlLoadJobs(){try{const arr=JSON.parse(andr('dlList')||'[]');for(const j of arr){if(!DL.jobs[j.id])DL.order.unshift(j.id);DL.jobs[j.id]=j}}catch(e){}}
+window.__dlEvent=e=>{
+  if(!e)return;
+  if(e.type==='engine'){DL.engine=e.engine;renderDl();if(e.message)toast(e.message);return}
+  const j=DL.jobs[e.id]||(DL.jobs[e.id]={id:e.id});
+  if(!DL.order.includes(e.id))DL.order.unshift(e.id);
+  Object.assign(j,e);
+  if(e.state==='done')toast('Descarga lista: '+(j.title||''));
+  if(e.state==='error')toast('La descarga falló');
+  renderDlJobs();
+};
+window.__rotuloLink=url=>{DL.url=url;showTab('dl');renderDl();toast('Enlace recibido')};
+function renderDl(){
+  const P=$('#dlPanel'); if(!P)return;
+  if(!A()){P.innerHTML=`<div class="gen"><h3>Descargar videos</h3><p class="note">Esta función está en la app Android de Rótulo: usa yt-dlp, el mismo motor de Seal, y no puede funcionar dentro de un navegador.</p></div>`;return}
+  const en=DL.engine||dlEngine()||{}, o=DL.opts;
+  P.innerHTML=`<div class="gen"><h3>Descargar videos</h3>
+    <p class="note">Pega el enlace de YouTube, Facebook, Instagram, TikTok, X, Vimeo u otro de los sitios que soporta yt-dlp. También puedes usar «Compartir → Rótulo» desde la app del video.</p>
+    <div class="row"><label class="fld grow"><span>Enlace</span><input id="dlUrl" type="url" inputmode="url" placeholder="https://…" value="${esc(DL.url)}" style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:9px 10px;width:100%"></label>
+      <button class="btn" data-dl="paste">Pegar</button></div>
+    <div class="row"><div class="fld"><span>Tipo</span><div class="seg"><button data-dk="video" class="${o.kind==='video'?'on':''}">Video</button><button data-dk="audio" class="${o.kind==='audio'?'on':''}">Solo audio</button></div></div>
+    ${o.kind==='video'?`<div class="fld"><span>Calidad máxima</span><div class="seg">${DLQ.map(([k,v])=>`<button data-dq="${k}" class="${o.q===k?'on':''}">${v}</button>`).join('')}</div></div>`:''}</div>
+    <button class="btn primary" data-dl="start" style="width:100%">Descargar</button>
+    <button class="btn" data-dl="browser" style="width:100%;margin-top:8px">Buscar el video en una página (navegador)</button>
+    <p class="note" style="margin-top:6px">Si el enlace no funciona, usa el navegador: abre la página, dale play al video y elige el archivo detectado (MP4, HLS, DASH…).</p>
+    <p class="note" style="margin-top:10px">Los videos quedan en la Galería (Movies/Rotulo) y el audio en Música (Music/Rotulo). Descarga solo contenido que tengas derecho a usar.</p>
+    <div class="dl" style="color:var(--muted);font-size:12px">${en.ready?`Motor listo · yt-dlp ${esc(en.ytdlp||'?')}`:en.error?`Error del motor: ${esc(en.error)}`:'Preparando el motor de descargas (la primera vez tarda unos segundos)…'}
+      ${en.ready?` · <button class="btn sm" data-dl="update" ${en.updating?'disabled':''}>${en.updating?'Actualizando…':'Actualizar yt-dlp'}</button>`:''}</div>
+  </div><div class="cues" id="dlJobs"></div>`;
+  renderDlJobs();
+  if(!en.ready&&!en.error)setTimeout(()=>{if($('#tab-dl').classList.contains('on'))renderDl()},2500);
+}
+function renderDlJobs(){
+  const L=$('#dlJobs'); if(!L)return;
+  L.innerHTML=DL.order.map(id=>{
+    const j=DL.jobs[id]; if(!j)return '';
+    const pct=Math.max(0,Math.min(100,j.progress||0));
+    let body='';
+    if(j.state==='running'||j.state==='starting'||j.state==='saving'){
+      body=`<div class="bar"><div style="width:${pct}%"></div></div><div class="meta"><span>${esc(j.state==='saving'?'Guardando en la Galería…':j.state==='starting'?'Iniciando…':(j.line||'').replace(/^\[download\]\s*/,'').slice(0,90))}</span><button class="btn sm danger" data-dlc="${id}">Cancelar</button></div>`;
+    }else if(j.state==='done'){
+      body=`<div class="ok">✓ ${j.kind==='audio'?'Audio guardado en Music/Rotulo':'Video guardado en Movies/Rotulo'} · ${(j.size/1048576||0).toFixed(1)} MB</div>
+        <div class="row" style="margin-top:8px">${j.kind==='video'?`<button class="btn sm primary" data-dlo="${id}">Abrir y generar subtítulos</button>`:''}<button class="btn sm" data-dls="${id}">Compartir</button></div>`;
+    }else if(j.state==='error'){
+      body=`<div class="err">${esc(j.error||'Error desconocido')}</div><div class="row" style="margin-top:8px"><button class="btn sm" data-dlr="${id}">Reintentar</button><button class="btn sm" data-dl="update">Actualizar yt-dlp</button></div>`;
+    }else if(j.state==='cancelled'){body=`<div class="note">Cancelada.</div>`}
+    return `<div class="cue"><div style="font-weight:600;margin-bottom:6px;word-break:break-word">${esc(j.title||j.url||'')}</div>${body}</div>`;
+  }).join('');
+}
+$('#dlPanel').addEventListener('click',e=>{
+  const b=e.target.closest('button'); if(!b)return;
+  const urlEl=$('#dlUrl'); if(urlEl)DL.url=urlEl.value.trim();
+  if(b.dataset.dk){DL.opts.kind=b.dataset.dk;renderDl();return}
+  if(b.dataset.dq){DL.opts.q=b.dataset.dq;renderDl();return}
+  if(b.dataset.dl==='paste'){const t=andr('clipboardText')||'';const m=t.match(/https?:\/\/\S+/);if(m){DL.url=m[0];renderDl()}else toast('No hay un enlace copiado');return}
+  if(b.dataset.dl==='start'){
+    if(!/^https?:\/\/\S+$/i.test(DL.url)){toast('Pega un enlace válido (https://…)');return}
+    const id=andr('dlStart',DL.url,DL.opts.kind,DL.opts.q);
+    if(!id){toast('No se pudo iniciar la descarga');return}
+    DL.jobs[id]={id,url:DL.url,title:DL.url,state:'starting',kind:DL.opts.kind,progress:0};DL.order.unshift(id);
+    DL.url='';renderDl();return;
+  }
+  if(b.dataset.dl==='browser'){andr('openBrowser',DL.url||'');return}
+  if(b.dataset.dl==='update'){andr('dlUpdate');if(DL.engine)DL.engine.updating=true;renderDl();return}
+  if(b.dataset.dlc){andr('dlCancel',b.dataset.dlc);return}
+  if(b.dataset.dlr){const j=DL.jobs[b.dataset.dlr];if(j){DL.url=j.url;DL.opts.kind=j.kind||'video';renderDl()}return}
+  if(b.dataset.dls){const j=DL.jobs[b.dataset.dls];if(j&&j.uri)andr('share',j.uri,j.kind==='audio'?'audio/*':'video/mp4');return}
+  if(b.dataset.dlo){
+    const j=DL.jobs[b.dataset.dlo]; if(!j||!j.uri)return;
+    if(!andr('preparePick',j.uri)){toast('No se encontró el archivo');return}
+    S.afterOpen='subs'; fileInput.click();
+  }
+});
+$('#dlPanel').addEventListener('input',e=>{if(e.target.id==='dlUrl')DL.url=e.target.value.trim()});
+
 /* ---------- App Android: video recibido desde "Compartir" ---------- */
 window.__rotuloShared=async()=>{
   const A=window.RotuloAndroid; if(!A||!A.hasShared())return;
@@ -1739,7 +1884,8 @@ window.__rotuloShared=async()=>{
     loadFile(new File([b],name,{type:b.type||'video/mp4'}));
   }catch(e){toast('No se pudo abrir el video compartido')}
 };
-if(window.RotuloAndroid)setTimeout(()=>window.__rotuloShared(),300);
+if(window.RotuloAndroid)setTimeout(()=>{window.__rotuloShared();dlLoadJobs();const l=andr('takeSharedLink');if(l)window.__rotuloLink(l)},300);
+$('#btnDl2').onclick=()=>showTab('dl');
 
 /* ---------- Inicio ---------- */
 S.subStyle=defaultSubStyle(); renderStickers(); renderEditor(); renderSubsTab(); renderTimeline(); layout(); setPlayIcon();

@@ -1,5 +1,6 @@
 package co.rotulo.app
 
+import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Intent
 import android.net.Uri
@@ -10,6 +11,7 @@ import android.provider.MediaStore
 import android.util.Base64
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
+import org.json.JSONObject
 import java.io.OutputStream
 
 /**
@@ -122,11 +124,7 @@ class RotuloBridge(private val activity: MainActivity) {
     @JavascriptInterface
     fun workStart(title: String) {
         activity.requestNotificationPermission()
-        activity.runOnUiThread {
-            try {
-                activity.startForegroundService(Intent(activity, WorkService::class.java).putExtra("title", title))
-            } catch (_: Exception) { }
-        }
+        WorkService.acquire(activity.applicationContext, title)
     }
 
     @JavascriptInterface
@@ -136,9 +134,48 @@ class RotuloBridge(private val activity: MainActivity) {
 
     @JavascriptInterface
     fun workEnd(text: String, ok: Boolean) {
-        try { activity.stopService(Intent(activity, WorkService::class.java)) } catch (_: Exception) { }
         try { WorkService.finished(activity, text) } catch (_: Exception) { }
+        WorkService.release(activity.applicationContext)
     }
+
+    // --- FFmpeg nativo ---
+    @JavascriptInterface fun ffReady(): Boolean = NativeFfmpeg.ready(activity)
+    @JavascriptInterface fun ffStart(argsJson: String): String = NativeFfmpeg.start(activity, activity.currentUri, argsJson)
+    @JavascriptInterface fun ffStatus(id: String): String = NativeFfmpeg.status(id)
+    @JavascriptInterface fun ffCancel(id: String) { NativeFfmpeg.cancel(id) }
+
+    // --- Descargas (yt-dlp) ---
+    @JavascriptInterface fun dlEngine(): String = Downloader.engine(activity).toString()
+    @JavascriptInterface fun dlList(): String = Downloader.list()
+
+    @JavascriptInterface
+    fun dlStart(url: String, kind: String, quality: String): String {
+        activity.requestNotificationPermission()
+        return Downloader.start(activity, url.trim(), kind, quality)
+    }
+
+    @JavascriptInterface fun dlCancel(id: String) { Downloader.cancel(id) }
+
+    @JavascriptInterface
+    fun dlUpdate() {
+        Downloader.updateNow(activity.applicationContext) { eng, msg ->
+            activity.pushJs("__dlEvent", JSONObject().put("type", "engine").put("engine", eng).put("message", msg).toString())
+        }
+    }
+
+    @JavascriptInterface fun openBrowser(url: String) { activity.openBrowser(url.ifBlank { "https://www.google.com" }) }
+
+    @JavascriptInterface
+    fun takeSharedLink(): String { val l = activity.sharedLink ?: ""; activity.sharedLink = null; return l }
+
+    @JavascriptInterface
+    fun preparePick(uriStr: String): Boolean = try { activity.pendingPick = Uri.parse(uriStr); true } catch (_: Exception) { false }
+
+    @JavascriptInterface
+    fun clipboardText(): String = try {
+        val cm = activity.getSystemService(ClipboardManager::class.java)
+        cm.primaryClip?.getItemAt(0)?.coerceToText(activity)?.toString() ?: ""
+    } catch (_: Exception) { "" }
 
     /** true si Android puede restringir la app en segundo plano por ahorro de batería. */
     @JavascriptInterface

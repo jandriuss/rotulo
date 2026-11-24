@@ -23,17 +23,22 @@ jobs:
       - name: Compilar APK de depuración
         run: gradle assembleDebug --no-daemon
       - name: Renombrar APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk Rotulo.apk
+        run: |
+          ls -la app/build/outputs/apk/debug/
+          cp app/build/outputs/apk/debug/app-arm64-v8a-debug.apk Rotulo.apk
+          cp app/build/outputs/apk/debug/app-armeabi-v7a-debug.apk Rotulo-armv7.apk
       - uses: actions/upload-artifact@v4
         with:
           name: Rotulo-apk
-          path: Rotulo.apk
+          path: |
+            Rotulo.apk
+            Rotulo-armv7.apk
       - name: Publicar en Releases (enlace directo para el celular)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="build-${{ github.run_number }}"
-          gh release create "$TAG" Rotulo.apk \
+          gh release create "$TAG" Rotulo.apk Rotulo-armv7.apk \
             --title "Rótulo (compilación ${{ github.run_number }})" \
-            --notes "APK de prueba compilado automáticamente desde el commit ${{ github.sha }}." \
+            --notes "APK de prueba compilado desde el commit ${{ github.sha }}. Rotulo.apk es para la mayoría de teléfonos (64 bits); Rotulo-armv7.apk para teléfonos antiguos de 32 bits." \
             --latest

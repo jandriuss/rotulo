@@ -20,6 +20,8 @@ import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.webkit.WebViewAssetLoader
 import org.json.JSONObject
+import java.io.File
+import java.io.FileInputStream
 import java.io.ByteArrayInputStream
 
 /**
@@ -53,6 +55,11 @@ class MainActivity : ComponentActivity() {
     @Volatile var currentName: String = ""
     @Volatile var currentSize: Long = -1
 
+    // Archivo que se entregará al próximo "Abrir video" (videos recién descargados)
+    @Volatile var pendingPick: Uri? = null
+    // Enlace recibido desde "Compartir" (texto) para descargar
+    @Volatile var sharedLink: String? = null
+
     private val pcmLock = Any()
     private var pcm: PcmReader? = null
 
@@ -63,6 +70,19 @@ class MainActivity : ComponentActivity() {
             fileCallback?.onReceiveValue(uris)
             fileCallback = null
         }
+
+    private val browser =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+            if (res.resultCode == RESULT_OK) web.evaluateJavascript("window.showTab && showTab('dl')", null)
+        }
+
+    fun openBrowser(url: String) {
+        runOnUiThread { browser.launch(Intent(this, BrowserActivity::class.java).putExtra(BrowserActivity.EXTRA_URL, url)) }
+    }
+
+    fun pushJs(fn: String, arg: String) {
+        runOnUiThread { try { web.evaluateJavascript("window.$fn && window.$fn($arg)", null) } catch (_: Exception) { } }
+    }
 
     private val askNotifications =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -77,6 +97,7 @@ class MainActivity : ComponentActivity() {
             .addPathHandler("/assets/", IsolatedHandler(WebViewAssetLoader.AssetsPathHandler(this)))
             .addPathHandler("/shared/", SharedVideoHandler())
             .addPathHandler("/pcm/", PcmHandler())
+            .addPathHandler("/ff/", FfHandler())
             .build()
 
         web = WebView(this)
@@ -92,6 +113,7 @@ class MainActivity : ComponentActivity() {
         // Que el motor de IA no pierda prioridad cuando la app no está visible
         web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
         web.addJavascriptInterface(RotuloBridge(this), "RotuloAndroid")
+        Downloader.listener = { o -> pushJs("__dlEvent", o.toString()) }
 
         web.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
@@ -113,6 +135,13 @@ class MainActivity : ComponentActivity() {
                 params: FileChooserParams
             ): Boolean {
                 fileCallback?.onReceiveValue(null)
+                // Video recién descargado: se entrega directo, sin abrir el selector
+                pendingPick?.let { uri ->
+                    pendingPick = null
+                    rememberVideo(uri)
+                    callback.onReceiveValue(arrayOf(uri))
+                    return true
+                }
                 fileCallback = callback
                 // Sin filtro de tipo: así aparecen también los .mkv, .avi, .ts, .rmvb, etc. que algunos
                 // teléfonos no marcan como "video". Rótulo decide después si puede abrirlo.
@@ -146,9 +175,11 @@ class MainActivity : ComponentActivity() {
         if (readShareIntent(intent)) {
             web.evaluateJavascript("window.__rotuloShared && window.__rotuloShared()", null)
         }
+        sharedLink?.let { l -> sharedLink = null; pushJs("__rotuloLink", JSONObject.quote(l)) }
     }
 
     override fun onDestroy() {
+        Downloader.listener = null
         synchronized(pcmLock) { pcm?.close(); pcm = null }
         super.onDestroy()
     }
@@ -179,6 +210,11 @@ class MainActivity : ComponentActivity() {
     private fun readShareIntent(intent: Intent?): Boolean {
         if (intent?.action != Intent.ACTION_SEND) return false
         val type = intent.type ?: return false
+        if (type.startsWith("text/")) {
+            val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return false
+            sharedLink = Regex("https?://\\S+").find(text)?.value
+            return false
+        }
         if (!type.startsWith("video/")) return false
         val uri: Uri? = if (Build.VERSION.SDK_INT >= 33) {
             intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
@@ -273,6 +309,37 @@ class MainActivity : ComponentActivity() {
                 synchronized(pcmLock) { try { pcm?.close() } catch (_: Exception) { }; pcm = null }
                 json(JSONObject().put("ok", false).put("error", e.message ?: e.toString()))
             }
+        }
+    }
+
+    /**
+     * FFmpeg nativo para la web:
+     *   /ff/pcm/<inicioMs>/<duraciónMs>  audio del video actual (s16le 16 kHz mono)
+     *   /ff/out/<nombre>                 archivo producido por un trabajo (proxy, imagen, etc.)
+     */
+    private inner class FfHandler : WebViewAssetLoader.PathHandler {
+        override fun handle(path: String): WebResourceResponse? {
+            val parts = path.trim('/').split('/')
+            return try {
+                when (parts.getOrNull(0)) {
+                    "pcm" -> {
+                        val uri = currentUri ?: return null
+                        val bytes = NativeFfmpeg.pcm(this@MainActivity, uri, parts[1].toLong(), parts[2].toLong())
+                        WebResourceResponse("application/octet-stream", null, ByteArrayInputStream(bytes))
+                            .apply { responseHeaders = mapOf("Cache-Control" to "no-store") }
+                    }
+                    "out" -> {
+                        val name = parts.getOrNull(1)?.replace("..", "") ?: return null
+                        val f = File(NativeFfmpeg.outDir(this@MainActivity), name)
+                        if (!f.exists()) return null
+                        val mime = when (f.extension.lowercase()) {
+                            "mp4" -> "video/mp4"; "jpg" -> "image/jpeg"; "png" -> "image/png"; else -> "application/octet-stream"
+                        }
+                        WebResourceResponse(mime, null, FileInputStream(f)).apply { responseHeaders = mapOf("Cache-Control" to "no-store") }
+                    }
+                    else -> null
+                }
+            } catch (e: Exception) { null }
         }
     }
 }
