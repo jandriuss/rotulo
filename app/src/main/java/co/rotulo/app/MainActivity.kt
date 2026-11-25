@@ -124,6 +124,10 @@ class MainActivity : ComponentActivity() {
                 val u = request.url
                 // Copia MP4 hecha por FFmpeg nativo: se sirve por partes (Range) para que el
                 // reproductor la lea sin cargarla completa en memoria
+                // Video ORIGINAL servido por partes desde su URI (sin copiarlo): para archivos grandes
+                if (u.host == HOST && (u.path ?: "").startsWith("/ff/src/")) {
+                    return streamUri(currentUri ?: return null, request.requestHeaders)
+                }
                 if (u.host == HOST && (u.path ?: "").startsWith("/ff/stream/")) {
                     val name = (u.lastPathSegment ?: return null).replace("..", "")
                     return streamFile(File(NativeFfmpeg.outDir(this@MainActivity), name), request.requestHeaders)
@@ -356,6 +360,46 @@ class MainActivity : ComponentActivity() {
                 }
             } catch (e: Exception) { null }
         }
+    }
+
+    private fun streamUri(uri: Uri, headers: Map<String, String>?): WebResourceResponse? {
+        val pfd = try { contentResolver.openFileDescriptor(uri, "r") } catch (_: Exception) { null } ?: return null
+        val len = pfd.statSize
+        if (len <= 0) { pfd.close(); return null }
+        val range = headers?.entries?.firstOrNull { it.key.equals("Range", true) }?.value
+        var start = 0L
+        var end = len - 1
+        if (range != null) {
+            Regex("bytes=(\\d*)-(\\d*)").find(range)?.let { m ->
+                if (m.groupValues[1].isNotEmpty()) start = m.groupValues[1].toLong()
+                if (m.groupValues[2].isNotEmpty()) end = minOf(m.groupValues[2].toLong(), len - 1)
+            }
+        }
+        if (start > end || start >= len) start = 0
+        val count = end - start + 1
+        val fis = java.io.FileInputStream(pfd.fileDescriptor)
+        fis.channel.position(start)
+        val body = object : InputStream() {
+            var left = count
+            override fun read(): Int {
+                if (left <= 0) return -1
+                val b = fis.read(); if (b >= 0) left--; return b
+            }
+            override fun read(b: ByteArray, off: Int, l: Int): Int {
+                if (left <= 0) return -1
+                val n = fis.read(b, off, minOf(l.toLong(), left).toInt()); if (n > 0) left -= n; return n
+            }
+            override fun close() { try { fis.close() } catch (_: Exception) { }; try { pfd.close() } catch (_: Exception) { } }
+        }
+        val mime = contentResolver.getType(uri)?.takeIf { it.startsWith("video/") } ?: "video/mp4"
+        val h = mutableMapOf(
+            "Accept-Ranges" to "bytes", "Content-Length" to count.toString(),
+            "Cache-Control" to "no-store", "Cross-Origin-Resource-Policy" to "same-origin"
+        )
+        return if (range != null) {
+            h["Content-Range"] = "bytes $start-$end/$len"
+            WebResourceResponse(mime, null, 206, "Partial Content", h, body)
+        } else WebResourceResponse(mime, null, 200, "OK", h, body)
     }
 
     private fun streamFile(f: File, headers: Map<String, String>?): WebResourceResponse? {

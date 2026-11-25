@@ -1140,7 +1140,14 @@ async function ffExec(args,onLine){
   if(nativeFF()){
     const id=andr('ffStart',JSON.stringify(args));
     if(!id)throw new Error('no se pudo iniciar FFmpeg nativo');
-    return await ffPoll(id,onLine);
+    const out=[];
+    const rc=await ffPoll(id,l=>{out.push(l);if(onLine)onLine(l)});
+    const txt=out.join('\n');
+    if(rc!==0&&/CANNOT LINK|not found: needed by|Permission denied|Error opening input file|No such file or directory/i.test(txt)){
+      glog('FFmpeg nativo no pudo trabajar ('+out.filter(Boolean).slice(-1)[0]+') → se usa el FFmpeg interno');
+      S.ffNativeBroken=true; return ffExec(args,onLine);
+    }
+    return rc;
   }
   const ff=await getFF(); const IN=await ffInput(ff);
   return ffRun(args.map(x=>x==='{IN}'?IN:(typeof x==='string'&&x.startsWith('@out/'))?'/'+x.slice(5):x),onLine);
@@ -1212,6 +1219,21 @@ async function ffPlaceholder(info){
 let convCancelled=false;
 function cancelConvert(silent){if(S.loading==='convert'){convCancelled=true;ffCancelAll();if(!silent)toast('Cancelado')}}
 $('#cvCancel').onclick=()=>{cancelConvert();$('#convert').classList.add('hidden');S.loading=null;if(!S.dur)$('#empty').classList.remove('hidden')};
+async function sniffContainer(){
+  try{
+    const b=new Uint8Array(await S.file.slice(0,400).arrayBuffer()), t=String.fromCharCode(...b.slice(0,12));
+    if(b[0]===0x47&&b[188]===0x47)return 'ts';
+    if(b[4]===0x47&&b[196]===0x47)return 'ts';            // m2ts (paquetes de 192 bytes)
+    if(/ftyp|moov|mdat|free|wide|skip/.test(t.slice(4,8)))return 'mp4';
+    if(b[0]===0x1a&&b[1]===0x45&&b[2]===0xdf&&b[3]===0xa3)return 'mkv';
+    if(t.startsWith('FLV'))return 'flv';
+    if(t.startsWith('RIFF')&&t.slice(8,12)==='AVI ')return 'avi';
+    if(b[0]===0&&b[1]===0&&b[2]===1&&b[3]===0xba)return 'mpg';
+    if(t.startsWith('OggS'))return 'ogg';
+    if(b[0]===0x30&&b[1]===0x26&&b[2]===0xb2&&b[3]===0x75)return 'asf';
+    return 'otro';
+  }catch(e){return 'desconocido'}
+}
 /* Códecs que el teléfono reproduce: si el video ya viene así (lo normal en .ts, .mkv, .flv descargados),
    basta con pasarlo a MP4 copiando los datos — sin recodificar, sin perder calidad y en segundos. */
 const COPY_V=['h264','hevc','vp8','vp9','av1'], COPY_A=['aac','mp3','opus','vorbis','flac'];
@@ -1248,9 +1270,16 @@ async function openCompat(why,opt={}){
     glog(`formato: ${info.format||'?'} · video: ${info.vcodec||'ninguno'} ${info.w}×${info.h} · audio: ${info.acodec||'ninguno'} · duración ${fmt(info.dur)}`);
     if(!info.vcodec)throw new Error(info.dur||info.acodec?'Este archivo no tiene imagen de video (parece ser solo audio).':'No se reconoce como video: puede estar dañado, incompleto o protegido (DRM).');
     const sizeMB=(S.file&&S.file.size||0)/1048576;
+    const cont=opt.cont||await sniffContainer(); glog('contenedor real: '+cont+' · '+sizeMB.toFixed(0)+' MB');
     let mode, src;
+    // 0) En Android: el original servido por partes, sin copiar (sirve para MP4/MKV grandes)
+    if(!opt.noStream&&A()&&['mp4','mkv'].includes(cont)&&COPY_V.includes(info.vcodec)){
+      mode='stream'; src='/ff/src/'+Date.now();
+      glog('se abre el original por partes (sin copiar)');
+    }
+    if(!mode&&['mp4','mkv'].includes(cont))opt.noRemux=true;      // copiar MP4→MP4 no arregla nada
     // 1) Copia rápida a MP4 (sin recodificar)
-    if(!opt.noRemux&&COPY_V.includes(info.vcodec)&&(native||(A()&&A().remuxStart)||sizeMB<=WASM_REMUX_MAX_MB)){
+    if(!mode&&!opt.noRemux&&COPY_V.includes(info.vcodec)&&(native||(A()&&A().remuxStart)||sizeMB<=WASM_REMUX_MAX_MB)){
       $('#cvTitle').textContent=`Preparando ${ext||'el video'} (copia rápida)`;
       $('#cvText').textContent=`El video ya viene en ${info.vcodec.toUpperCase()}: se pasa a MP4 sin recodificar, así que no pierde calidad y tarda poco.`;
       const t0=performance.now();
@@ -1268,7 +1297,7 @@ async function openCompat(why,opt={}){
         mode='remux';
         src=nativeFF()?'/ff/stream/remux.mp4?v='+Date.now():URL.createObjectURL(new Blob([await ffRead('remux.mp4')],{type:'video/mp4'}));
       }catch(e){if(convCancelled||/cancelado/.test(e.message))throw e;glog('la copia rápida no funcionó: '+e.message)}
-    }else if(!opt.noRemux&&COPY_V.includes(info.vcodec)){
+    }else if(!mode&&!opt.noRemux&&COPY_V.includes(info.vcodec)){
       glog(`archivo de ${sizeMB.toFixed(0)} MB: en el navegador la copia rápida se limita a ${WASM_REMUX_MAX_MB} MB`);
     }
     if(!mode){
@@ -1292,7 +1321,7 @@ async function openCompat(why,opt={}){
       }
     }
     if(convCancelled)return;
-    S.compat={mode,placeholder:mode==='placeholder',lite:false,info:{format:info.format,vcodec:info.vcodec,acodec:info.acodec,w:info.w,h:info.h,dur:info.dur}};
+    S.compat={mode,cont,placeholder:mode==='placeholder',lite:false,info:{format:info.format,vcodec:info.vcodec,acodec:info.acodec,w:info.w,h:info.h,dur:info.dur}};
     if(mode==='placeholder')S.afterOpen='subs';
     S.loading='proxy';
     if(S.url&&S.url.startsWith('blob:'))URL.revokeObjectURL(S.url);
@@ -1312,6 +1341,11 @@ async function openCompat(why,opt={}){
 }
 /* Si la copia rápida no se puede reproducir (p. ej. HEVC en un teléfono sin decodificador), se usa el plan B */
 function compatFallback(why){
+  if(S.loading==='proxy'&&S.compat&&S.compat.mode==='stream'){
+    glog('el original por partes no se reproduce ('+why+') → siguiente opción');
+    const info=S.compat.info, cont=S.compat.cont; S.compat=null; S.loading='direct';
+    openCompat(why,{noStream:true,info,cont}); return true;
+  }
   if(!(S.loading==='proxy'&&S.compat&&S.compat.mode==='remux'))return false;
   if(String(S.url).startsWith('/ff/stream/')&&!S.compat.triedBlob&&(S.file&&S.file.size||0)<400*1048576){
     S.compat.triedBlob=true; glog('la copia por partes no se reprodujo ('+why+') → se carga completa');
@@ -1322,7 +1356,7 @@ function compatFallback(why){
     return true;
   }
   glog('la copia rápida no se reproduce ('+why+') → conversión o modo solo subtítulos');
-  const info=S.compat.info; S.compat=null; S.loading='direct'; openCompat(why,{noRemux:true,info});
+  const info=S.compat.info, cont=S.compat.cont; S.compat=null; S.loading='direct'; openCompat(why,{noRemux:true,noStream:true,info,cont});
   return true;
 }
 /* Audio por partes con el FFmpeg NATIVO de Android (cualquier formato, rápido) */
@@ -1741,7 +1775,7 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
 }
 
 /* --- Diagnóstico: revisa cada pieza y deja el resultado en «Detalles técnicos» --- */
-const APP_BUILD='build-9';
+const APP_BUILD='build-10';
 async function runDiag(){
   const D=$('details'); if(D)D.open=true;
   const ok=(b,t)=>glog((b?'✔ ':'✘ ')+t);
@@ -1758,6 +1792,12 @@ async function runDiag(){
     glog(`video: ${S.name} · ${(S.file.size/1048576).toFixed(1)} MB · tipo "${S.file.type||'?'}" · modo ${S.compat?S.compat.mode:'directo'} · cargando=${S.loading||'no'}`);
     glog(`reproductor: estado ${video.readyState} · ${video.videoWidth}×${video.videoHeight} · duración ${fmt(video.duration||0)} · error ${video.error?video.error.code+' '+(video.error.message||''):'ninguno'} · fuente ${String(video.currentSrc||'').slice(0,40)}`);
     if(A()){try{const j=await (await fetch('/ff/probe',{cache:'no-store'})).json();ok(!!j.ok,'Android lee el video: '+JSON.stringify(j))}catch(e){ok(false,'Android lee el video: '+e.message)}}
+    glog('contenedor real: '+await sniffContainer());
+    if(A()){
+      const v=document.createElement('video');v.muted=true;v.preload='metadata';v.className='offscreen';document.body.appendChild(v);
+      const r=await new Promise(res=>{const t=setTimeout(()=>res('sin respuesta en 12 s'),12000);v.onloadedmetadata=()=>{clearTimeout(t);res('ok '+v.videoWidth+'×'+v.videoHeight)};v.onerror=()=>{clearTimeout(t);res('error '+(v.error&&v.error.message||''))};v.src='/ff/src/diag'+Date.now()});
+      ok(r.startsWith('ok'),'reproducir el original por partes: '+r); v.removeAttribute('src');v.load();v.remove();
+    }
     if(nativeAudioOk()){try{const r=await fetch('/pcm/open/0',{cache:'no-store'});const j=await r.json();ok(!!j.ok,'lector de audio de Android: '+JSON.stringify(j));fetch('/pcm/close').catch(()=>{})}catch(e){ok(false,'lector de audio de Android: '+e.message)}}
   }else glog('(no hay video abierto: abre el video con problemas y vuelve a tocar «Probar la app»)');
   try{const t=await resolveTjs();ok(true,'motor de IA: '+(t.wasm?'incluido en la app':'desde internet (CDN)'))}catch(e){ok(false,'motor de IA: '+e.message)}

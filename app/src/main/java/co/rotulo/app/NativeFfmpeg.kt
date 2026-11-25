@@ -32,7 +32,13 @@ object NativeFfmpeg {
     @Volatile var lastPcmRc = 0
 
     private fun bin(ctx: Context) = File(ctx.applicationInfo.nativeLibraryDir, "libffmpeg.so")
-    private fun libDir(ctx: Context) = File(ctx.noBackupFilesDir, "youtubedl-android/packages/ffmpeg/usr/lib")
+    // Igual que youtubedl-android: FFmpeg necesita también las librerías del paquete de Python
+    // (ahí viene libc++_shared.so). Sin esto falla con "CANNOT LINK EXECUTABLE".
+    private fun libPath(ctx: Context): String {
+        val pk = File(ctx.noBackupFilesDir, "youtubedl-android/packages")
+        return listOf("python", "ffmpeg", "aria2c").joinToString(":") { File(pk, "$it/usr/lib").absolutePath } +
+            ":" + ctx.applicationInfo.nativeLibraryDir
+    }
     fun outDir(ctx: Context) = File(ctx.cacheDir, "ff").apply { mkdirs() }
 
     fun ready(ctx: Context) = RotuloApp.ready && bin(ctx).exists()
@@ -41,7 +47,7 @@ object NativeFfmpeg {
 
     private fun builder(ctx: Context, args: List<String>): ProcessBuilder {
         val pb = ProcessBuilder(listOf(bin(ctx).absolutePath) + args)
-        pb.environment()["LD_LIBRARY_PATH"] = libDir(ctx).absolutePath
+        pb.environment()["LD_LIBRARY_PATH"] = libPath(ctx)
         pb.environment()["TMPDIR"] = ctx.cacheDir.absolutePath
         return pb
     }
