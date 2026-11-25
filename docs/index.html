@@ -1278,6 +1278,7 @@ async function openCompat(why,opt={}){
       glog('se abre el original por partes (sin copiar)');
     }
     if(!mode&&['mp4','mkv'].includes(cont))opt.noRemux=true;      // copiar MP4→MP4 no arregla nada
+    if(!mode&&info.dur>FF_LITE_SEC){opt.noRemux=true;glog('video largo: se omite la copia y se usa el modo solo subtítulos')}
     // 1) Copia rápida a MP4 (sin recodificar)
     if(!mode&&!opt.noRemux&&COPY_V.includes(info.vcodec)&&(native||(A()&&A().remuxStart)||sizeMB<=WASM_REMUX_MAX_MB)){
       $('#cvTitle').textContent=`Preparando ${ext||'el video'} (copia rápida)`;
@@ -1329,8 +1330,8 @@ async function openCompat(why,opt={}){
     $('#cvTitle').textContent='Abriendo el video…'; $('#cvText').textContent='Ya está listo; el reproductor lo está cargando.'; $('#cvPct').textContent=''; $('#cvBar').style.width='100%';
     glog(`abriendo resultado (${mode}): ${String(src).slice(0,40)}`);
     clearTimeout(loadWatch);
-    loadWatch=setTimeout(()=>{if(S.loading!=='proxy')return;glog('el reproductor no respondió en 15 s');
-      if(!compatFallback('el reproductor no respondió')){S.loading=null;C.classList.add('hidden');$('#empty').classList.remove('hidden');toast('El reproductor no pudo abrir el video. Revisa «Probar la app» en la pestaña Subtítulos.')}},15000);
+    loadWatch=setTimeout(()=>{if(S.loading!=='proxy')return;glog('el reproductor no respondió en 25 s');
+      if(!compatFallback('el reproductor no respondió')){S.loading=null;C.classList.add('hidden');$('#empty').classList.remove('hidden');toast('El reproductor no pudo abrir el video. Revisa «Probar la app» en la pestaña Subtítulos.')}},25000);
   }catch(e){
     if(convCancelled)return;
     S.loading=null; C.classList.add('hidden'); $('#empty').classList.remove('hidden');
@@ -1362,6 +1363,7 @@ function compatFallback(why){
 /* Audio por partes con el FFmpeg NATIVO de Android (cualquier formato, rápido) */
 class NativeFfSource{
   constructor(){this.label='FFmpeg nativo de Android'}
+  async seek(sec){this.t=sec;return sec}
   async open(startSec){if(!nativeFF())throw new Error('FFmpeg nativo no disponible');this.t=startSec;await this.read(SR);this.t=startSec;return startSec}
   async read(n){
     const secs=n/SR; if(this.t>=S.dur+0.5)return new Float32Array(0);
@@ -1379,6 +1381,7 @@ class NativeFfSource{
 /* Audio por partes con FFmpeg wasm desde el archivo original (navegador) */
 class FFmpegSource{
   constructor(){this.label='FFmpeg del navegador (cualquier formato)'}
+  async seek(sec){this.t=sec;return sec}
   async open(startSec){const ff=await getFF();this.IN=await ffInput(ff);this.t=startSec;return startSec}
   async read(n){
     const secs=n/SR; if(this.t>=S.dur+0.5)return new Float32Array(0);
@@ -1543,6 +1546,7 @@ class NativeSource{              // App Android: MediaExtractor + MediaCodec, po
     for(let i=0;i<i16.length;i++)f[i]=i16[i]/32768;
     return f;
   }
+  async seek(sec){try{await fetch('/pcm/close',{cache:'no-store'})}catch(e){}return this.open(sec)}
   close(){fetch('/pcm/close',{cache:'no-store'}).catch(()=>{})}
 }
 class MemorySource{              // Navegador: decodeAudioData del archivo completo (videos cortos)
@@ -1552,6 +1556,7 @@ class MemorySource{              // Navegador: decodeAudioData del archivo compl
     this.buf=await extractAudio(); this.i=Math.floor(startSec*SR); return startSec;
   }
   async read(n){const s=this.buf.subarray(this.i,Math.min(this.buf.length,this.i+n));this.i+=s.length;return s.slice()}
+  async seek(sec){this.i=Math.floor(sec*SR);return sec}
   close(){this.buf=null}
 }
 async function extractAudio(){
@@ -1658,6 +1663,8 @@ function updGenUI(){
     if(done>20&&el>10){const sp=done/el, rem=(S.dur-(g.cursor||0))/sp;t+=` · velocidad ${sp.toFixed(1)}× · faltan ~${rem>3600?Math.floor(rem/3600)+' h '+Math.round(rem%3600/60)+' min':Math.max(1,Math.round(rem/60))+' min'}`}
     c.textContent=t;
   }
+  const gl=$('#genLang');
+  if(gl&&g.lang)gl.textContent=`Idioma del video: ${langName(g.lang)}${g.detected?' (detectado)':''}. Si no es correcto: Pausar → elige el idioma arriba → «Empezar de nuevo».`;
   if(d){const l=S.subs.slice(-2);d.textContent=l.map(x=>`${fmt(x.start)}  ${x.text}`).join('\n')}
 }
 function friendlyErr(e){
@@ -1706,6 +1713,21 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
     const model=ASR_MODELS[o.q]||ASR_MODELS.base;
     let lang=S.gen.lang||(o.src==='auto'?null:o.src);
     const queue=[];
+    if(!lang&&S.dur>240&&src.seek){
+      // Videos largos: el comienzo suele ser música o intro. Se escucha en varios puntos y se vota.
+      setGen('Cargando el modelo de voz y detectando el idioma (escuchando varias partes)…');
+      const votes={}; let n=0;
+      for(const f of [0.12,0.3,0.5,0.7,0.85]){
+        if(n>=3)break;
+        const at=S.dur*f; await src.seek(at); const a=await src.read(25*SR);
+        if(!a.length||rms(a)<0.01){glog(`idioma en ${fmt(at)}: sin voz suficiente`);continue}
+        try{const r=await aiCall({type:'detect',model,audio:a},[a.buffer]);if(r.lang){votes[r.lang]=(votes[r.lang]||0)+1;n++;glog(`idioma en ${fmt(at)}: ${langName(r.lang)}`)}}
+        catch(e){if(/cancelado/.test(e.message))throw e;glog('detección falló en '+fmt(at)+': '+e.message)}
+      }
+      win.t=await src.seek(realStart);
+      const best=Object.entries(votes).sort((x,y)=>y[1]-x[1])[0];
+      if(best){lang=best[0];glog(`idioma elegido: ${langName(lang)} (${best[1]} de ${n} muestras)`);S.gen.detected=true}
+    }
     if(!lang){
       setGen('Cargando el modelo de voz y detectando el idioma…');
       for(let k=0;k<6;k++){const w=await win.next();if(!w)break;queue.push(w);if(rms(w.audio)>0.02)break}
@@ -1775,7 +1797,7 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
 }
 
 /* --- Diagnóstico: revisa cada pieza y deja el resultado en «Detalles técnicos» --- */
-const APP_BUILD='build-10';
+const APP_BUILD='build-11';
 async function runDiag(){
   const D=$('details'); if(D)D.open=true;
   const ok=(b,t)=>glog((b?'✔ ':'✘ ')+t);
@@ -1843,7 +1865,7 @@ function renderSubsTab(){
   let h=`<div class="gen"><h3>Subtítulos automáticos</h3>`;
   if(g.running){
     h+=`<div class="gen-run"><div class="stage" id="genMsg">${esc(g.msg||'')}</div><div class="bar"><div id="genBar" style="width:${(g.p||0)*100}%"></div></div>
-      <div class="dl" id="genEta"></div><div class="dl" id="genDl"></div>
+      <div class="dl" id="genEta"></div><div class="dl" id="genDl"></div><div class="dl" id="genLang" style="color:var(--text)"></div>
       <pre class="dl" id="genLast" style="white-space:pre-wrap;margin:6px 0 0;font-family:var(--font)"></pre>
       <p class="note">${isAndroid?'Puedes salir de la app o apagar la pantalla: seguirá trabajando y verás el avance en la notificación. ':'Deja esta pestaña abierta y la pantalla encendida. '}Los subtítulos aparecen en el video a medida que se generan.</p>
       <button class="btn" data-sa="cancel">Pausar</button></div>`;
