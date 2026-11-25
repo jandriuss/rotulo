@@ -1502,6 +1502,16 @@ self.onmessage = async e => {
   } catch (err) { postMessage({ type:'error', id:m.id, message: String((err && err.message) || err) }); }
 };`}
 let aiWorker=null, aiReq=0, aiThreads=1; const aiPending=new Map(); const dlFiles={};
+const DL_STALL_MS=45000; let dlLast=0, dlStalls=0, dlLogged={}, dlSpeed={t:0,b:0,v:0};
+const dlIncomplete=()=>Object.values(dlFiles).some(f=>f.total>0&&f.loaded<f.total);
+setInterval(()=>{
+  if(!aiWorker||!aiPending.size||!dlIncomplete()||!dlLast)return;
+  if(Date.now()-dlLast<DL_STALL_MS)return;
+  dlStalls++; dlLast=0;
+  glog(`la descarga del modelo no avanza hace ${DL_STALL_MS/1000} s (intento ${dlStalls}); se reinicia la descarga (lo ya completo queda guardado)`);
+  for(const k of Object.keys(dlFiles))if(dlFiles[k].loaded<dlFiles[k].total)delete dlFiles[k];
+  killWorker(true,'descarga detenida');
+},5000);
 async function getWorker(){
   if(aiWorker)return aiWorker;
   const t=await resolveTjs();
@@ -1521,9 +1531,14 @@ async function getWorker(){
 function aiSend(msg,transfer){return new Promise(async(res,rej)=>{try{const w=await getWorker();const id=++aiReq;aiPending.set(id,{res,rej});w.postMessage(Object.assign({id},msg),transfer||[])}catch(e){rej(e)}})}
 /* Si el motor con varios hilos falla, se reinicia con 1 hilo y se reintenta una vez */
 async function aiCall(msg,transfer){
-  const backup=(!forceSingle&&msg.audio)?msg.audio.slice():null;
+  const backup=msg.audio?msg.audio.slice():null;
   try{return await aiSend(msg,transfer)}
   catch(e){
+    if(/descarga detenida/.test(e.message)){
+      if(dlStalls>4)throw new Error('La descarga del modelo de IA se detuvo varias veces. Revisa la conexión (mejor con wifi) y vuelve a tocar «Continuar»; lo ya descargado no se pierde.');
+      if(backup)msg=Object.assign({},msg,{audio:backup});
+      return await aiCall(msg,backup?[backup.buffer]:[]);
+    }
     if(/cancelado|fetch|network|NetworkError|Failed to load|Load failed|404|401|403/i.test(e.message)||forceSingle||aiThreads<=1)throw e;
     glog('falló con '+aiThreads+' hilos ('+e.message+'); reintento con 1 hilo');
     forceSingle=true; killWorker(true);
@@ -1531,14 +1546,21 @@ async function aiCall(msg,transfer){
     return await aiSend(msg,backup?[backup.buffer]:[]);
   }
 }
-function killWorker(silent){if(aiWorker){aiWorker.terminate();aiWorker=null}aiPending.forEach(p=>p.rej(new Error(silent?'reinicio':'cancelado')));aiPending.clear()}
+function killWorker(silent,why){if(aiWorker){aiWorker.terminate();aiWorker=null}aiPending.forEach(p=>p.rej(new Error(why||(silent?'reinicio':'cancelado'))));aiPending.clear()}
 function onModelProgress(m){
-  if(m.status==='progress'&&m.file){dlFiles[m.stage+m.file]={loaded:m.loaded,total:m.total}}
+  if(m.status==='progress'&&m.file){dlFiles[m.stage+m.file]={loaded:m.loaded,total:m.total};dlLast=Date.now()}
+  if(m.status==='initiate')dlLast=Date.now();
   if(m.status==='done'&&m.file&&dlFiles[m.stage+m.file]){const f=dlFiles[m.stage+m.file];f.loaded=f.total}
   const fs=Object.entries(dlFiles).filter(([k])=>k.startsWith(m.stage)).map(([,v])=>v);
   const tot=fs.reduce((a,b)=>a+(b.total||0),0), ld=fs.reduce((a,b)=>a+(b.loaded||0),0);
+  const what=m.stage==='asr'?'el modelo de voz':'el modelo de traducción', pc=tot>0?Math.floor(ld/tot*100):0;
+  // velocidad de descarga (promedio de los últimos segundos)
+  const now=Date.now(); if(now-dlSpeed.t>=3000){if(dlSpeed.t&&ld>=dlSpeed.b)dlSpeed.v=(ld-dlSpeed.b)/((now-dlSpeed.t)/1000);dlSpeed.t=now;dlSpeed.b=ld}
+  const step=Math.floor(pc/10)*10, key=m.stage;
+  if(tot>0&&ld<tot&&(dlLogged[key]??-1)<step){dlLogged[key]=step;glog(`descargando ${what}: ${pc} % (${(ld/1048576).toFixed(0)} de ${(tot/1048576).toFixed(0)} MB)`)}
+  if(tot>0&&ld>=tot&&dlLogged[key]!==100){dlLogged[key]=100;glog(`${what}: descarga completa, preparando…`)}
   const el=$('#genDl'); if(!el)return;
-  if(tot>0&&ld<tot) el.textContent=`Descargando ${m.stage==='asr'?'el modelo de voz':'el modelo de traducción'}: ${Math.floor(ld/tot*100)} % de ${(tot/1048576).toFixed(0)} MB (solo la primera vez)`;
+  if(tot>0&&ld<tot) el.textContent=`Descargando ${what}: ${pc} % (${(ld/1048576).toFixed(0)} de ${(tot/1048576).toFixed(0)} MB${dlSpeed.v>0?' · '+(dlSpeed.v/1048576).toFixed(1)+' MB/s':''}). Solo la primera vez; si se detiene, la app reintenta sola.`;
   else if(tot>0) el.textContent='';
 }
 
@@ -1550,12 +1572,19 @@ class NativeSource{              // App Android: MediaExtractor + MediaCodec, po
     const r=await fetch('/pcm/open/'+Math.round(startSec*1000),{cache:'no-store'});
     const j=await r.json(); if(!j.ok)throw new Error(j.error||'no se pudo leer el audio');
     glog(`audio nativo: ${j.rate} Hz, ${j.channels} canal(es), ${j.mime||''}, inicio ${fmt(j.startSec)}`);
-    return j.startSec??startSec;
+    this.t=j.startSec??startSec; return this.t;
   }
-  async read(n){
+  async read(n,retry){
     const r=await fetch('/pcm/next/'+n,{cache:'no-store'});
     if(!r.ok)throw new Error('lectura de audio: HTTP '+r.status);
+    if(/json/.test(r.headers.get('content-type')||'')){      // el lector se cerró: se reabre donde iba
+      const j=await r.json().catch(()=>({}));
+      if(retry)throw new Error('lectura de audio: '+(j.error||'el lector se cerró'));
+      glog('el lector de audio se cerró ('+(j.error||'?')+'); se reabre en '+fmt(this.t||0));
+      await this.open(this.t||0); return this.read(n,true);
+    }
     const i16=new Int16Array(await r.arrayBuffer()), f=new Float32Array(i16.length);
+    this.t=(this.t||0)+i16.length/SR;
     for(let i=0;i<i16.length;i++)f[i]=i16[i]/32768;
     return f;
   }
@@ -1830,7 +1859,7 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
 }
 
 /* --- Diagnóstico: revisa cada pieza y deja el resultado en «Detalles técnicos» --- */
-const APP_BUILD='build-12';
+const APP_BUILD='build-13';
 async function runDiag(){
   const D=$('details'); if(D)D.open=true;
   const ok=(b,t)=>glog((b?'✔ ':'✘ ')+t);
@@ -1853,7 +1882,8 @@ async function runDiag(){
       const r=await new Promise(res=>{const t=setTimeout(()=>res('sin respuesta en 12 s'),12000);v.onloadedmetadata=()=>{clearTimeout(t);res('ok '+v.videoWidth+'×'+v.videoHeight)};v.onerror=()=>{clearTimeout(t);res('error '+(v.error&&v.error.message||''))};v.src='/ff/src/diag'+Date.now()});
       ok(r.startsWith('ok'),'reproducir el original por partes: '+r); v.removeAttribute('src');v.load();v.remove();
     }
-    if(nativeAudioOk()){try{const r=await fetch('/pcm/open/0',{cache:'no-store'});const j=await r.json();ok(!!j.ok,'lector de audio de Android: '+JSON.stringify(j));fetch('/pcm/close').catch(()=>{})}catch(e){ok(false,'lector de audio de Android: '+e.message)}}
+    if(S.gen.running)glog('(lector de audio: no se prueba porque se están generando subtítulos)');
+    else if(nativeAudioOk()){try{const r=await fetch('/pcm/open/0',{cache:'no-store'});const j=await r.json();ok(!!j.ok,'lector de audio de Android: '+JSON.stringify(j));fetch('/pcm/close').catch(()=>{})}catch(e){ok(false,'lector de audio de Android: '+e.message)}}
   }else glog('(no hay video abierto: abre el video con problemas y vuelve a tocar «Probar la app»)');
   try{const t=await resolveTjs();ok(true,'motor de IA: '+(t.wasm?'incluido en la app':'desde internet (CDN)'))}catch(e){ok(false,'motor de IA: '+e.message)}
   try{const r=await fetch('https://huggingface.co/onnx-community/whisper-base/resolve/main/config.json',{cache:'no-store'});ok(r.ok,'descarga de modelos (Hugging Face): HTTP '+r.status)}catch(e){ok(false,'descarga de modelos (Hugging Face): '+e.message)}
