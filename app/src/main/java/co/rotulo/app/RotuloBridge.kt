@@ -143,6 +143,7 @@ class RotuloBridge(private val activity: MainActivity) {
     @JavascriptInterface fun ffStart(argsJson: String): String = NativeFfmpeg.start(activity, activity.currentUri, argsJson)
     @JavascriptInterface fun ffStatus(id: String): String = NativeFfmpeg.status(id)
     @JavascriptInterface fun ffCancel(id: String) { NativeFfmpeg.cancel(id) }
+    @JavascriptInterface fun remuxStart(): String = NativeFfmpeg.startRemux(activity, activity.currentUri)
     @JavascriptInterface
     fun ffCleanup() {
         try { NativeFfmpeg.outDir(activity).listFiles()?.forEach { it.delete() } } catch (_: Exception) { }

@@ -1134,25 +1134,29 @@ async function ffRun(args,onLine){
 }
 /* --- FFmpeg unificado: NATIVO en la app Android (rápido) o wasm en el navegador ---
    Los argumentos usan '{IN}' para el video original y '@out/nombre' para archivos de salida. */
-const nativeFF=()=>!!andr('ffReady');
+const nativeFF=()=>!S.ffNativeBroken&&!!andr('ffReady');
 async function ffExec(args,onLine){
   if(nativeFF()){
     const id=andr('ffStart',JSON.stringify(args));
     if(!id)throw new Error('no se pudo iniciar FFmpeg nativo');
-    S.ffJob=id; let seen=0;
-    try{
-      while(true){
-        await sleep(350);
-        let st={};try{st=JSON.parse(andr('ffStatus',id)||'{}')}catch(e){}
-        const tail=st.tail||[], n=st.n||0;
-        if(onLine&&n>seen){const fresh=tail.slice(-Math.min(tail.length,n-seen));fresh.forEach(onLine)}
-        seen=n;
-        if(st.done){if(st.cancelled)throw new Error('cancelado');return st.rc}
-      }
-    }finally{S.ffJob=null}
+    return await ffPoll(id,onLine);
   }
   const ff=await getFF(); const IN=await ffInput(ff);
   return ffRun(args.map(x=>x==='{IN}'?IN:(typeof x==='string'&&x.startsWith('@out/'))?'/'+x.slice(5):x),onLine);
+}
+/* Espera un trabajo nativo (FFmpeg o copia rápida) y entrega sus líneas de salida */
+async function ffPoll(id,onLine){
+  S.ffJob=id; let seen=0;
+  try{
+    while(true){
+      await sleep(350);
+      let st={};try{st=JSON.parse(andr('ffStatus',id)||'{}')}catch(e){}
+      const tail=st.tail||[], n=st.n||0;
+      if(n>seen){const fresh=tail.slice(-Math.min(tail.length,n-seen));if(onLine)fresh.forEach(onLine);S.ffTail=(S.ffTail||[]).concat(fresh).slice(-12)}
+      seen=n;
+      if(st.done){if(st.cancelled)throw new Error('cancelado');return st.rc}
+    }
+  }finally{S.ffJob=null}
 }
 async function ffRead(name){
   if(nativeFF()){const r=await fetch('/ff/out/'+name,{cache:'no-store'});if(!r.ok)throw new Error('FFmpeg no produjo '+name);return await r.blob()}
@@ -1162,9 +1166,18 @@ async function ffRead(name){
 function ffCancelAll(){if(S.ffJob)andr('ffCancel',S.ffJob);ffKill()}
 const hms=t=>{const m=/(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(t);return m?(+m[1]*3600+ +m[2]*60+ +m[3]):0};
 async function ffProbe(){
-  const lines=[];
+  const lines=[], wasNative=nativeFF();
   await ffExec(['-hide_banner','-i','{IN}'],m=>lines.push(m));
   const txt=lines.join('\n');
+  if(!/Input #0/.test(txt)){
+    const last=lines.filter(l=>l.trim()).slice(-2).join(' | ')||'sin respuesta';
+    if(wasNative){
+      // El FFmpeg nativo no pudo leer el archivo (restricción de Android): se usa el FFmpeg interno
+      glog('FFmpeg nativo no pudo leer el archivo ('+last+') → se usa el FFmpeg interno');
+      S.ffNativeBroken=true; return ffProbe();
+    }
+    throw new Error('FFmpeg no pudo leer el archivo: '+last);
+  }
   const d=/Duration:\s*([\d:.]+)/.exec(txt);
   const v=/Stream #[^\n]*Video:\s*([^,\s(]+)[^\n]*?,\s*(\d{2,5})x(\d{2,5})/.exec(txt);
   const a=/Stream #[^\n]*Audio:\s*([^,\s(]+)/.exec(txt);
@@ -1223,22 +1236,36 @@ async function openCompat(why,opt={}){
   $('#cvText').textContent='El reproductor del teléfono no abre este archivo directamente. El original no se modifica.';
   $('#cvBar').style.width='0%'; $('#cvPct').textContent=native?'':'Cargando el convertidor…';
   try{
-    const info=opt.info||await ffProbe();
+    let info=opt.info||null;
+    if(!info&&A()&&A().remuxStart){
+      try{const j=await (await fetch('/ff/probe',{cache:'no-store'})).json();
+        if(j.ok&&j.vcodec){info={dur:j.dur,vcodec:j.vcodec,w:j.w,h:j.h,acodec:j.acodec,format:'(Android)'};glog('análisis con Android: '+JSON.stringify(j))}
+        else glog('Android no pudo analizarlo: '+(j.error||'sin pista de video'))}catch(e){glog('análisis de Android falló: '+e.message)}
+    }
+    if(!info)info=await ffProbe();
     if(convCancelled)return;
     glog(`formato: ${info.format||'?'} · video: ${info.vcodec||'ninguno'} ${info.w}×${info.h} · audio: ${info.acodec||'ninguno'} · duración ${fmt(info.dur)}`);
     if(!info.vcodec)throw new Error(info.dur||info.acodec?'Este archivo no tiene imagen de video (parece ser solo audio).':'No se reconoce como video: puede estar dañado, incompleto o protegido (DRM).');
     const sizeMB=(S.file&&S.file.size||0)/1048576;
     let mode, src;
     // 1) Copia rápida a MP4 (sin recodificar)
-    if(!opt.noRemux&&COPY_V.includes(info.vcodec)&&(native||sizeMB<=WASM_REMUX_MAX_MB)){
+    if(!opt.noRemux&&COPY_V.includes(info.vcodec)&&(native||(A()&&A().remuxStart)||sizeMB<=WASM_REMUX_MAX_MB)){
       $('#cvTitle').textContent=`Preparando ${ext||'el video'} (copia rápida)`;
       $('#cvText').textContent=`El video ya viene en ${info.vcodec.toUpperCase()}: se pasa a MP4 sin recodificar, así que no pierde calidad y tarda poco.`;
       const t0=performance.now();
-      try{
+      let nativeOk=false;
+      if(A()&&A().remuxStart&&['h264','hevc','av1'].includes(info.vcodec)){
+        try{
+          const rc=await ffPoll(andr('remuxStart'),ffTimeProg(info,t0));
+          if(rc===0){nativeOk=true;mode='remux';src='/ff/stream/remux.mp4?v='+Date.now();glog(`copia rápida con Android lista en ${((performance.now()-t0)/1000).toFixed(1)} s`)}
+          else glog('copia rápida con Android falló: '+(S.ffTail||[]).slice(-2).join(' | '));
+        }catch(e){if(convCancelled||/cancelado/.test(e.message))throw e;glog('copia rápida con Android falló: '+e.message)}
+      }
+      if(!nativeOk)try{
         await ffRemux(info);
         glog(`copia a MP4 lista en ${((performance.now()-t0)/1000).toFixed(1)} s`);
         mode='remux';
-        src=native?'/ff/stream/remux.mp4?v='+Date.now():URL.createObjectURL(new Blob([await ffRead('remux.mp4')],{type:'video/mp4'}));
+        src=nativeFF()?'/ff/stream/remux.mp4?v='+Date.now():URL.createObjectURL(new Blob([await ffRead('remux.mp4')],{type:'video/mp4'}));
       }catch(e){if(convCancelled||/cancelado/.test(e.message))throw e;glog('la copia rápida no funcionó: '+e.message)}
     }else if(!opt.noRemux&&COPY_V.includes(info.vcodec)){
       glog(`archivo de ${sizeMB.toFixed(0)} MB: en el navegador la copia rápida se limita a ${WASM_REMUX_MAX_MB} MB`);
@@ -1288,12 +1315,14 @@ function compatFallback(why){
 /* Audio por partes con el FFmpeg NATIVO de Android (cualquier formato, rápido) */
 class NativeFfSource{
   constructor(){this.label='FFmpeg nativo de Android'}
-  async open(startSec){if(!nativeFF())throw new Error('FFmpeg nativo no disponible');this.t=startSec;return startSec}
+  async open(startSec){if(!nativeFF())throw new Error('FFmpeg nativo no disponible');this.t=startSec;await this.read(SR);this.t=startSec;return startSec}
   async read(n){
     const secs=n/SR; if(this.t>=S.dur+0.5)return new Float32Array(0);
     const r=await fetch(`/ff/pcm/${Math.round(this.t*1000)}/${Math.round(secs*1000)}`,{cache:'no-store'});
     if(!r.ok)throw new Error('FFmpeg nativo: HTTP '+r.status);
     const buf=await r.arrayBuffer(); this.t+=secs;
+    const rc=+(r.headers.get('X-Rc')||0);
+    if(rc!==0&&!buf.byteLength){S.ffNativeBroken=true;throw new Error('FFmpeg nativo no pudo leer el audio (código '+rc+')')}
     const i16=new Int16Array(buf,0,buf.byteLength>>1);
     if(!i16.length)return this.t<S.dur-0.5?new Float32Array(n):new Float32Array(0);
     const f=new Float32Array(i16.length);for(let i=0;i<i16.length;i++)f[i]=i16[i]/32768;return f;
@@ -1618,7 +1647,7 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
     if(nativeAudioOk())chain.push(()=>new NativeSource());
     if(nativeAudioOk()&&nativeFF())chain.push(()=>new NativeFfSource());
     if(!S.compat&&S.dur<=WEB_MAX_SEC)chain.push(()=>new MemorySource());
-    if(!nativeFF())chain.push(()=>new FFmpegSource());
+    chain.push(()=>new FFmpegSource());
     let realStart=startSec,lastErr=null;
     for(const mk of chain){
       const s=mk();

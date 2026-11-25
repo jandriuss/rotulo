@@ -29,6 +29,7 @@ object NativeFfmpeg {
     }
 
     private val jobs = ConcurrentHashMap<String, Job>()
+    @Volatile var lastPcmRc = 0
 
     private fun bin(ctx: Context) = File(ctx.applicationInfo.nativeLibraryDir, "libffmpeg.so")
     private fun libDir(ctx: Context) = File(ctx.noBackupFilesDir, "youtubedl-android/packages/ffmpeg/usr/lib")
@@ -97,6 +98,20 @@ object NativeFfmpeg {
         return id
     }
 
+    /** Copia rápida a MP4 con MediaExtractor + MediaMuxer, como trabajo consultable con status(). */
+    fun startRemux(ctx: Context, uri: Uri?): String {
+        val id = UUID.randomUUID().toString()
+        val job = Job(id); jobs[id] = job
+        val add: (String) -> Unit = { l -> synchronized(job) { job.lines.addLast(l); if (job.lines.size > 80) job.lines.removeFirst(); job.n++ } }
+        if (uri == null) { add("error: no hay video abierto"); job.rc = -1; job.done = true; return id }
+        Thread({
+            try {
+                job.rc = NativeMedia.remux(ctx, uri, File(outDir(ctx), "remux.mp4"), add) { job.cancelled }
+            } catch (e: Exception) { add("error: ${e.message}"); job.rc = -1 } finally { job.done = true }
+        }, "remux-$id").start()
+        return id
+    }
+
     fun status(id: String): String {
         val j = jobs[id] ?: return JSONObject().put("done", true).put("rc", -1).put("n", 1)
             .put("tail", JSONArray().put("trabajo no encontrado")).toString()
@@ -126,7 +141,7 @@ object NativeFfmpeg {
             val p = builder(ctx, args).start()
             val drain = Thread { try { p.errorStream.readBytes() } catch (_: Exception) { } }.apply { start() }
             val bytes = p.inputStream.readBytes()
-            p.waitFor(); drain.join(2000)
+            lastPcmRc = p.waitFor(); drain.join(2000)
             return bytes
         }
     }

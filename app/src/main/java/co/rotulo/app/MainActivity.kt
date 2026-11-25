@@ -337,7 +337,11 @@ class MainActivity : ComponentActivity() {
                         val uri = currentUri ?: return null
                         val bytes = NativeFfmpeg.pcm(this@MainActivity, uri, parts[1].toLong(), parts[2].toLong())
                         WebResourceResponse("application/octet-stream", null, ByteArrayInputStream(bytes))
-                            .apply { responseHeaders = mapOf("Cache-Control" to "no-store") }
+                            .apply { responseHeaders = mapOf("Cache-Control" to "no-store", "X-Rc" to NativeFfmpeg.lastPcmRc.toString()) }
+                    }
+                    "probe" -> {
+                        val uri = currentUri ?: return json(JSONObject().put("ok", false).put("error", "no hay video abierto"))
+                        json(NativeMedia.probe(this@MainActivity, uri))
                     }
                     "out" -> {
                         val name = parts.getOrNull(1)?.replace("..", "") ?: return null
