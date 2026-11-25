@@ -1,5 +1,6 @@
 package co.rotulo.app
 
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Intent
@@ -109,6 +110,55 @@ class RotuloBridge(private val activity: MainActivity) {
             }
         }
     } catch (_: Exception) { "" }
+
+    // --- Ver la película en VLC / MX Player con los subtítulos cargados ---
+    @JavascriptInterface
+    fun playWithSubs(srtUri: String): String {
+        val video = activity.currentUri ?: return "Abre de nuevo el video desde Rótulo para poder reproducirlo"
+        return try {
+            val subs = Uri.parse(srtUri)
+            val cr = activity.contentResolver
+            // Ruta real del .srt (VLC la usa para cargar los subtítulos)
+            var subPath = ""
+            var subName = "subtitulos.srt"
+            try {
+                cr.query(subs, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.RELATIVE_PATH), null, null, null)?.use { c ->
+                    if (c.moveToFirst()) {
+                        subName = c.getString(0) ?: subName
+                        val rel = c.getString(1) ?: (Environment.DIRECTORY_DOWNLOADS + "/Rotulo/")
+                        subPath = Environment.getExternalStorageDirectory().absolutePath + "/" + rel.trimEnd('/') + "/" + subName
+                    }
+                }
+            } catch (_: Exception) {}
+            val i = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(video, "video/*")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                clipData = ClipData.newUri(cr, "video", video).apply { addItem(ClipData.Item(subs)) }
+                // MX Player
+                putExtra("subs", arrayOf<android.os.Parcelable>(subs))
+                putExtra("subs.enable", arrayOf<android.os.Parcelable>(subs))
+                putExtra("subs.name", arrayOf(subName))
+                putExtra("title", activity.currentName)
+                // VLC
+                if (subPath.isNotEmpty()) putExtra("subtitles_location", subPath)
+            }
+            val pm = activity.packageManager
+            val players = pm.queryIntentActivities(i, 0)
+            if (players.isEmpty()) return "No hay un reproductor de video instalado: instala VLC o MX Player desde Play Store"
+            // Si está VLC o MX Player, se prefiere (son los que cargan subtítulos externos)
+            val pref = listOf("org.videolan.vlc", "com.mxtech.videoplayer.pro", "com.mxtech.videoplayer.ad")
+                .firstOrNull { pk -> players.any { it.activityInfo.packageName == pk } }
+            activity.runOnUiThread {
+                try {
+                    if (pref != null) activity.startActivity(Intent(i).setPackage(pref))
+                    else activity.startActivity(Intent.createChooser(i, "Ver con subtítulos"))
+                } catch (e: Exception) {
+                    try { activity.startActivity(Intent.createChooser(i, "Ver con subtítulos")) } catch (_: Exception) {}
+                }
+            }
+            if (pref == null) "ok-other" else "ok"
+        } catch (e: Exception) { "No se pudo abrir el reproductor: " + (e.message ?: "") }
+    }
 
     // --- Audio nativo por partes ---
     /** true si el video abierto en la web es el mismo que la app puede leer de forma nativa. */

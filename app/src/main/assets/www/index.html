@@ -1385,8 +1385,13 @@ class FFmpegSource{
   async open(startSec){const ff=await getFF();this.IN=await ffInput(ff);this.t=startSec;return startSec}
   async read(n){
     const secs=n/SR; if(this.t>=S.dur+0.5)return new Float32Array(0);
+    // FFmpeg wasm acumula memoria tras muchas ejecuciones: se reinicia cada 40 tramos y, si falla, se reinicia y se reintenta una vez
+    this.runs=(this.runs||0)+1;
+    if(this.runs%40===0){ffKill();this.IN=await ffInput(await getFF())}
+    const args=()=>['-hide_banner','-nostdin','-y','-ss',this.t.toFixed(3),'-i',this.IN,'-t',secs.toFixed(3),'-map','0:a:0','-vn','-sn','-dn','-ac','1','-ar','16000','-f','s16le','/a.pcm'];
+    try{await ffRun(args())}
+    catch(e){glog('FFmpeg se reinicia ('+String(e&&e.message||e).slice(0,80)+')');ffKill();this.IN=await ffInput(await getFF());await ffRun(args())}
     const ff=await getFF();
-    await ffRun(['-hide_banner','-nostdin','-y','-ss',this.t.toFixed(3),'-i',this.IN,'-t',secs.toFixed(3),'-map','0:a:0','-vn','-sn','-dn','-ac','1','-ar','16000','-f','s16le','/a.pcm']);
     let data=new Uint8Array(0);try{data=await ff.readFile('/a.pcm');await ff.deleteFile('/a.pcm')}catch(e){}
     this.t+=secs;
     const i16=new Int16Array(data.buffer,data.byteOffset,data.byteLength>>1);
@@ -1410,7 +1415,11 @@ const MT_MODEL='Xenova/opus-mt-en-es';
 const SR=16000;
 const WEB_MAX_SEC=30*60;            // en el navegador el audio completo va a memoria: límite prudente
 const LANGS={auto:'Detectar idioma',en:'Inglés',pt:'Portugués',fr:'Francés',it:'Italiano',de:'Alemán',ja:'Japonés',ko:'Coreano',zh:'Chino',ru:'Ruso',ar:'Árabe',hi:'Hindi',nl:'Neerlandés',tr:'Turco',pl:'Polaco',uk:'Ucraniano',es:'Español'};
-const langName=c=>LANGS[c]||c;
+const LANG_EXTRA={ja:'Japonés',ko:'Coreano',zh:'Chino',th:'Tailandés',vi:'Vietnamita',id:'Indonesio',ms:'Malayo',tl:'Tagalo',fa:'Persa',he:'Hebreo',el:'Griego',sv:'Sueco',da:'Danés',no:'Noruego',fi:'Finés',cs:'Checo',ro:'Rumano',hu:'Húngaro',ca:'Catalán',gl:'Gallego',eu:'Euskera',bn:'Bengalí',ta:'Tamil',ur:'Urdu'};
+const langName=c=>LANGS[c]||LANG_EXTRA[c]||c;
+const fmtTop=t=>(t||[]).slice(0,3).map(([k,v])=>`${langName(k)} ${Math.round(v*100)} %`).join(' · ');
+function topLangs(sum,n){return Object.entries(sum).map(([k,v])=>[k,v/Math.max(1,n)]).sort((a,b)=>b[1]-a[1])}
+const HARD_LANGS=['ja','ko','zh','th','vi','ar','hi','fa','he','bn','ta','ur'];
 const SUB_PRESETS=[
   {n:'Caja negra',p:{color:'#ffffff',bgOn:true,bgColor:'#000000',bgOp:0.6,strokeW:0,shadow:false}},
   {n:'Contorno',p:{color:'#ffffff',bgOn:false,strokeW:0.12,strokeColor:'#000000',shadow:true}},
@@ -1464,16 +1473,20 @@ async function detect(p, audio){
   const dec = new Tensor('int64', BigInt64Array.from([BigInt(sot)]), [1, 1]);
   const out = await p.model({ input_features: feats.input_features, decoder_input_ids: dec });
   const L = out.logits, V = L.dims[L.dims.length - 1], off = L.data.length - V;
-  let best = null, bv = -Infinity;
-  for (const [tok, id] of Object.entries(l2i)) { const v = Number(L.data[off + id]); if (v > bv) { bv = v; best = tok; } }
-  return best ? best.replace(/[<|>]/g, '') : null;
+  const ent = Object.entries(l2i).map(([tok, id]) => [tok.replace(/[<|>]/g, ''), Number(L.data[off + id])]);
+  if (!ent.length) return { lang: null, top: [] };
+  const mx = Math.max(...ent.map(e => e[1]));
+  const ex = ent.map(([k, v]) => [k, Math.exp(v - mx)]), sum = ex.reduce((a, b) => a + b[1], 0);
+  const top = ex.map(([k, v]) => [k, v / sum]).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  return { lang: top[0][0], top };
 }
 self.onmessage = async e => {
   const m = e.data;
   try {
     if (m.type === 'detect') {
       const p = await getAsr(m.model);
-      postMessage({ type:'detect', id:m.id, lang: await detect(p, m.audio) });
+      const d = await detect(p, m.audio);
+      postMessage({ type:'detect', id:m.id, lang: d.lang, top: d.top });
     } else if (m.type === 'asr') {
       const p = await getAsr(m.model);
       const opts = { return_timestamps: true, task: m.task };
@@ -1664,7 +1677,12 @@ function updGenUI(){
     c.textContent=t;
   }
   const gl=$('#genLang');
-  if(gl&&g.lang)gl.textContent=`Idioma del video: ${langName(g.lang)}${g.detected?' (detectado)':''}. Si no es correcto: Pausar → elige el idioma arriba → «Empezar de nuevo».`;
+  if(gl&&g.lang){
+    const sure=!g.langTop||!g.detected||g.langTop[0][1]>=0.6;
+    gl.textContent=`Idioma del video: ${g.detected&&g.langTop?fmtTop(g.langTop):langName(g.lang)}${g.detected?' (detectado)':''}.`
+      +(sure?'':' La detección no está segura: la app lo vuelve a revisar durante el proceso y se corrige sola si se equivocó.')
+      +(HARD_LANGS.includes(g.lang)&&S.genOpts.q==='base'?' Para este idioma la precisión «Precisa» traduce bastante mejor (es más lenta).':'');
+  }
   if(d){const l=S.subs.slice(-2);d.textContent=l.map(x=>`${fmt(x.start)}  ${x.text}`).join('\n')}
 }
 function friendlyErr(e){
@@ -1715,18 +1733,20 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
     const queue=[];
     if(!lang&&S.dur>240&&src.seek){
       // Videos largos: el comienzo suele ser música o intro. Se escucha en varios puntos y se vota.
-      setGen('Cargando el modelo de voz y detectando el idioma (escuchando varias partes)…');
-      const votes={}; let n=0;
-      for(const f of [0.12,0.3,0.5,0.7,0.85]){
-        if(n>=3)break;
+      setGen('Cargando el modelo de voz y detectando el idioma (escuchando varias partes del video)…');
+      const sum={}; let n=0;
+      for(const f of [0.15,0.35,0.55,0.75,0.25,0.45,0.65,0.85]){
+        // mínimo 3 muestras con voz; si aún no hay un idioma claro (≥ 70 %), se siguen escuchando partes
+        if(n>=3){const t=topLangs(sum,n);if(t[0]&&t[0][1]>=0.7)break}
         const at=S.dur*f; await src.seek(at); const a=await src.read(25*SR);
         if(!a.length||rms(a)<0.01){glog(`idioma en ${fmt(at)}: sin voz suficiente`);continue}
-        try{const r=await aiCall({type:'detect',model,audio:a},[a.buffer]);if(r.lang){votes[r.lang]=(votes[r.lang]||0)+1;n++;glog(`idioma en ${fmt(at)}: ${langName(r.lang)}`)}}
+        try{const r=await aiCall({type:'detect',model,audio:a},[a.buffer]);
+          if(r.top&&r.top.length){n++;r.top.forEach(([k,v])=>sum[k]=(sum[k]||0)+v);glog(`idioma en ${fmt(at)}: ${fmtTop(r.top)}`)}}
         catch(e){if(/cancelado/.test(e.message))throw e;glog('detección falló en '+fmt(at)+': '+e.message)}
       }
       win.t=await src.seek(realStart);
-      const best=Object.entries(votes).sort((x,y)=>y[1]-x[1])[0];
-      if(best){lang=best[0];glog(`idioma elegido: ${langName(lang)} (${best[1]} de ${n} muestras)`);S.gen.detected=true}
+      const t=topLangs(sum,n);
+      if(t[0]){lang=t[0][0];S.gen.langTop=t;S.gen.detected=true;glog(`idioma elegido: ${fmtTop(t)} (${n} muestras)`)}
     }
     if(!lang){
       setGen('Cargando el modelo de voz y detectando el idioma…');
@@ -1735,21 +1755,34 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
       const voiced=queue.filter(w=>rms(w.audio)>0.003);
       if(!voiced.length&&win.eof)throw new Error('No se encontró voz en el audio del video.');
       const cand=(voiced.length?voiced:queue).reduce((m,w)=>rms(w.audio)>rms(m.audio)?w:m);
-      try{const r=await aiCall({type:'detect',model,audio:cand.audio.slice()});lang=r.lang&&LANGS[r.lang]?r.lang:(r.lang||'en');glog('idioma detectado: '+lang)}
+      try{const r=await aiCall({type:'detect',model,audio:cand.audio.slice()});lang=r.lang||'en';S.gen.langTop=r.top||null;glog('idioma detectado: '+(r.top?fmtTop(r.top):lang))}
       catch(e){if(/cancelado/.test(e.message))throw e;glog('falló la detección de idioma: '+e.message+' → se usa inglés');lang='en';S.gen.detectFail=true}
       S.gen.detected=true;
     }
     S.gen.lang=lang;
     const same=o.tgt==='same';
-    const task=(same||lang==='es'||lang==='en')?'transcribe':'translate';
-    const needMT=!same&&lang!=='es';
-    glog(`tarea: ${task}${needMT?' + traducción en→es':''}`);
+    let task, needMT;
+    const setLang=l=>{lang=l;S.gen.lang=l;task=(same||l==='es'||l==='en')?'transcribe':'translate';needMT=!same&&l!=='es';glog(`tarea: ${task}${needMT?' + traducción en→es':''} (${langName(l)})`)};
+    setLang(lang);
+    const recheck=o.src==='auto'; let voicedN=0, doubt=null, redone=false;
     let n=0;
     while(true){
       const w=queue.length?queue.shift():await win.next();
       if(!w)break;
       const wd=w.audio.length/SR; n++;
       if(rms(w.audio)>0.003){
+        voicedN++;
+        // Cada ~6 minutos con voz se vuelve a comprobar el idioma; si otro gana dos veces seguidas con claridad, se corrige
+        if(recheck&&voicedN%12===0&&rms(w.audio)>0.01){
+          try{const r=await aiCall({type:'detect',model,audio:w.audio.slice()});const tp=r.top&&r.top[0];
+            if(tp&&tp[0]!==lang&&tp[1]>=0.7){if(doubt===tp[0]){glog(`corrección de idioma en ${fmt(w.start)}: ${langName(lang)} → ${fmtTop(r.top)}`);setLang(tp[0]);S.gen.langTop=r.top;S.gen.langChanged=true;doubt=null;
+              // Lo ya traducido con el idioma equivocado se rehace desde el comienzo (una sola vez, para no entrar en un ciclo)
+              if(!redone&&src.seek){redone=true;S.subs=S.subs.filter(c=>c.end<=realStart+0.05);win.carry=new Float32Array(0);win.eof=false;win.t=await src.seek(realStart);queue.length=0;voicedN=0;
+                glog(`se rehacen los subtítulos desde ${fmt(realStart)} con el idioma corregido`);setGen(`Idioma corregido a ${langName(lang).toLowerCase()}: rehaciendo desde el comienzo…`);renderTimeline();continue}}
+              else doubt=tp[0]}
+            else doubt=null;
+          }catch(e){if(/cancelado/.test(e.message))throw e}
+        }
         setGen(`${needMT?'Escuchando y traduciendo':'Escuchando'} (${langName(lang).toLowerCase()})…`);
         const t1=performance.now();
         const r=await aiCall({type:'asr',model,task,language:lang,audio:w.audio},[w.audio.buffer]);
@@ -1775,7 +1808,7 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
     if(!S.subStyle)S.subStyle=defaultSubStyle();
     S.subOn=true; clearProgress();
     const secs=Math.round((performance.now()-S.gen.t0)/1000);
-    S.gen={running:false,done:{n:S.subs.length,lang,task,needMT,secs,detected:o.src==='auto',detectFail:S.gen.detectFail}};
+    S.gen={running:false,done:{n:S.subs.length,lang,task,needMT,secs,detected:o.src==='auto',detectFail:S.gen.detectFail,top:S.gen.langTop,changed:S.gen.langChanged}};
     glog(`terminado: ${S.subs.length} subtítulos en ${secs} s`);
     commit(); refreshAll();
     toast(`Listo: ${S.subs.length} subtítulos`);
@@ -1797,7 +1830,7 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
 }
 
 /* --- Diagnóstico: revisa cada pieza y deja el resultado en «Detalles técnicos» --- */
-const APP_BUILD='build-11';
+const APP_BUILD='build-12';
 async function runDiag(){
   const D=$('details'); if(D)D.open=true;
   const ok=(b,t)=>glog((b?'✔ ':'✘ ')+t);
@@ -1846,6 +1879,17 @@ async function saveSrt(){
   }catch(e){toast('No se pudo guardar el .srt: '+(e.message||e))}
 }
 
+function playWithSubs(){
+  if(!S.subs.length||!A())return;
+  const name=(S.name.replace(/\.[^.]+$/,'')||'video')+'.srt';
+  const u=andr('saveText',name,buildSrt());
+  if(!u){toast('No se pudieron guardar los subtítulos');return}
+  const r=andr('playWithSubs',u);
+  if(r==='ok')toast('Abriendo el reproductor con los subtítulos…');
+  else if(r==='ok-other')toast('Abriendo el reproductor… Si no muestra los subtítulos, instala VLC (gratis) y vuelve a tocar «Ver con subtítulos».');
+  else toast(r||'No se encontró un reproductor: instala VLC o MX Player');
+}
+
 /* --- Panel de subtítulos --- */
 let lastCue=-2;
 function markCue(i){
@@ -1886,7 +1930,8 @@ function renderSubsTab(){
     if(g.error)h+=`<div class="err">${esc(g.error)}</div>`;
     if(g.done){
       const d=g.done;
-      h+=`<div class="ok">✓ ${d.n} subtítulos en ${d.secs>=120?Math.round(d.secs/60)+' min':d.secs+' s'}${d.detected?` · idioma detectado: ${esc(langName(d.lang))}`:''}${d.needMT&&d.task==='translate'?' · traducido pasando por inglés':''}.</div>`;
+      h+=`<div class="ok">✓ ${d.n} subtítulos en ${d.secs>=120?Math.round(d.secs/60)+' min':d.secs+' s'}${d.detected?` · idioma detectado: ${esc(d.top?fmtTop(d.top):langName(d.lang))}`:''}${d.changed?' (corregido durante el proceso)':''}${d.needMT&&d.task==='translate'?' · traducido pasando por inglés':''}.</div>`;
+      if(HARD_LANGS.includes(d.lang)&&S.genOpts.q==='base')h+=`<p class="note" style="margin-top:6px">Si la traducción quedó floja, genera de nuevo con precisión «Precisa»: con ${esc(langName(d.lang).toLowerCase())} la diferencia es grande.</p>`;
       if(d.detected)h+=`<p class="note" style="margin-top:6px">${d.detectFail?'No se pudo detectar el idioma y se usó inglés. ':''}Si el idioma no es el correcto, elígelo arriba y genera de nuevo.</p>`;
     }
   }
@@ -1896,7 +1941,8 @@ function renderSubsTab(){
     const st=S.subStyle, long=S.dur>20*60;
     h+=`<label class="switch"><span>Mostrar subtítulos en el video</span><input type="checkbox" data-sa="toggle" ${S.subOn?'checked':''}></label>
     ${long?`<div class="warn" style="margin-bottom:12px">Para películas lo práctico es <b>Descargar .srt</b> y abrirlo junto con la película en VLC o MX Player (con el mismo nombre del video se carga solo). Quemar los subtítulos en el video con «Exportar» tarda lo mismo que dura la película.</div>`:''}
-    <div class="row"><button class="btn sm primary" data-sa="srt">Descargar .srt</button><button class="btn sm danger" data-sa="clear">Borrar subtítulos</button></div>
+    <div class="row">${A()?'<button class="btn sm primary" data-sa="play">▶ Ver con subtítulos</button>':''}<button class="btn sm ${A()?'':'primary'}" data-sa="srt">Descargar .srt</button><button class="btn sm danger" data-sa="clear">Borrar subtítulos</button></div>
+    ${A()?'<p class="note">«Ver con subtítulos» abre la película en VLC o MX Player con los subtítulos ya cargados. Si no tienes ninguno, instala VLC (gratis) desde Play Store.</p>':''}
     <div class="sect"><h4>Estilo de los subtítulos</h4>
       <div class="chips">${SUB_PRESETS.map((p,i)=>`<button class="chip" data-sp="${i}">${p.n}</button>`).join('')}</div>
       ${srng('Tamaño','size',1.5,10,0.1,0.01,'%')}
@@ -1932,6 +1978,7 @@ SP.addEventListener('click',e=>{
   if(a==='nogen'){S.gen.confirm=false;renderSubsTab();return}
   if(a==='cancel'){killWorker();return}
   if(a==='srt'){saveSrt();return}
+  if(a==='play'){playWithSubs();return}
   if(a==='battery'){andr('openBatterySettings');return}
   if(a==='diag'){runDiag();return}
   if(a==='copylog'){const t=diag.join('\n');(navigator.clipboard&&navigator.clipboard.writeText(t).then(()=>toast('Detalles copiados'),()=>toast('No se pudo copiar; selecciónalos y cópialos a mano')))||toast('Selecciona el texto y cópialo');return}
