@@ -564,6 +564,7 @@ function loadFile(f){
   if(S.exporting||S.gen.running)return;
   cancelConvert(true);
   if(S.url)URL.revokeObjectURL(S.url);
+  andr('ffCleanup');
   S.url=URL.createObjectURL(f); S.file=f; S.name=f.name||'video'; S.compat=null; S.loading='direct';
   $('#convert').classList.add('hidden');
   video.src=S.url; video.load();
@@ -573,6 +574,7 @@ function loadFile(f){
 video.addEventListener('loadedmetadata',async()=>{
   if(!video.videoWidth){
     if(S.loading==='direct'){openCompat('el reproductor no reconoce la imagen');return}
+    if(compatFallback('sin imagen'))return;
     toast('Ese archivo no tiene imagen de video.');return;
   }
   clearTimeout(loadWatch); S.loading=null;
@@ -591,7 +593,7 @@ video.addEventListener('loadedmetadata',async()=>{
   if(S.compat&&S.compat.placeholder)toast('Modo solo subtítulos: genera los subtítulos y descarga el .srt');else toast('Video cargado: '+S.vw+'×'+S.vh+', '+fmt(d));
   if(S.afterOpen){showTab(S.afterOpen);S.afterOpen=null}
 });
-video.addEventListener('error',()=>{if(!S.url)return;if(S.loading==='direct'){openCompat('formato no compatible con el reproductor');return}S.loading=null;toast('No se pudo abrir ese video.')});
+video.addEventListener('error',()=>{if(!S.url)return;if(S.loading==='direct'){openCompat('formato no compatible con el reproductor');return}if(compatFallback('error del reproductor'))return;S.loading=null;toast('No se pudo abrir ese video.')});
 $('#restoreYes').onclick=()=>{if(pendingRestore){applySnap(pendingRestore);if(!S.subStyle)S.subStyle=defaultSubStyle();commit();refreshAll();ensureFonts().then(draw)}$('#restore').classList.add('hidden')};
 $('#restoreNo').onclick=()=>{store.clear();$('#restore').classList.add('hidden')};
 
@@ -1196,44 +1198,77 @@ async function ffPlaceholder(info){
 let convCancelled=false;
 function cancelConvert(silent){if(S.loading==='convert'){convCancelled=true;ffCancelAll();if(!silent)toast('Cancelado')}}
 $('#cvCancel').onclick=()=>{cancelConvert();$('#convert').classList.add('hidden');S.loading=null;if(!S.dur)$('#empty').classList.remove('hidden')};
-async function openCompat(why){
+/* Códecs que el teléfono reproduce: si el video ya viene así (lo normal en .ts, .mkv, .flv descargados),
+   basta con pasarlo a MP4 copiando los datos — sin recodificar, sin perder calidad y en segundos. */
+const COPY_V=['h264','hevc','vp8','vp9','av1'], COPY_A=['aac','mp3','opus','vorbis','flac'];
+const WASM_REMUX_MAX_MB=250;           // en el navegador la copia ocupa memoria: límite prudente
+function ffTimeProg(info,t0){return m=>{const t=/time=\s*([\d:.]+)/.exec(m);if(!t||!info.dur)return;const p=clamp(hms(t[1])/info.dur,0,1);
+  $('#cvBar').style.width=(p*100).toFixed(1)+'%';const el=(performance.now()-t0)/1000, rem=p>0.02?el*(1-p)/p:0;
+  $('#cvPct').textContent=`${Math.floor(p*100)} %`+(rem?` · faltan ~${rem>90?Math.round(rem/60)+' min':Math.round(rem)+' s'}`:'')}}
+async function ffRemux(info){
+  const args=['-hide_banner','-nostdin','-y','-i','{IN}','-map','0:v:0','-map','0:a:0?','-c:v','copy'];
+  if(info.vcodec==='hevc')args.push('-tag:v','hvc1');
+  if(!info.acodec||COPY_A.includes(info.acodec))args.push('-c:a','copy');else args.push('-c:a','aac','-b:a','160k','-ac','2');
+  args.push('-sn','-dn','-movflags','+faststart','@out/remux.mp4');
+  const rc=await ffExec(args,ffTimeProg(info,performance.now()));
+  if(rc!==0)throw new Error('la copia a MP4 terminó con código '+rc);
+}
+async function openCompat(why,opt={}){
   if(S.loading!=='direct')return;
   clearTimeout(loadWatch); S.loading='convert'; convCancelled=false;
-  const name=S.name, ext=((name.match(/\.([a-z0-9]{1,6})$/i)||[])[1]||'').toUpperCase();
-  glog(`apertura directa falló (${why}): ${name} → FFmpeg ${nativeFF()?'nativo':'wasm'}`);
+  const name=S.name, ext=((name.match(/\.([a-z0-9]{1,6})$/i)||[])[1]||'').toUpperCase(), native=nativeFF();
+  glog(`apertura directa falló (${why}): ${name} → FFmpeg ${native?'nativo':'wasm'}`);
   $('#empty').classList.add('hidden'); const C=$('#convert'); C.classList.remove('hidden');
   $('#cvTitle').textContent='Analizando '+(ext?'el formato '+ext:'el video')+'…';
-  $('#cvText').textContent='El reproductor del teléfono no abre este formato directamente. El archivo original no se modifica.';
-  $('#cvBar').style.width='0%'; $('#cvPct').textContent=nativeFF()?'':'Cargando el convertidor…';
+  $('#cvText').textContent='El reproductor del teléfono no abre este archivo directamente. El original no se modifica.';
+  $('#cvBar').style.width='0%'; $('#cvPct').textContent=native?'':'Cargando el convertidor…';
   try{
-    const info=await ffProbe();
+    const info=opt.info||await ffProbe();
     if(convCancelled)return;
     glog(`formato: ${info.format||'?'} · video: ${info.vcodec||'ninguno'} ${info.w}×${info.h} · audio: ${info.acodec||'ninguno'} · duración ${fmt(info.dur)}`);
     if(!info.vcodec)throw new Error(info.dur||info.acodec?'Este archivo no tiene imagen de video (parece ser solo audio).':'No se reconoce como video: puede estar dañado, incompleto o protegido (DRM).');
-    const long=info.dur>FF_LITE_SEC; let blob;
-    if(long){
-      $('#cvTitle').textContent='Modo solo subtítulos';
-      $('#cvText').textContent=`Video largo (${fmt(info.dur).replace(/\.\d$/,'')}) en un formato que el teléfono no reproduce. Para no esperar una conversión, verás una imagen fija y los subtítulos se generarán directo del audio original.`;
-      $('#cvPct').textContent='Preparando…';
-      blob=await ffPlaceholder(info);
-    }else{
-      $('#cvTitle').textContent=`Convirtiendo ${ext||'el video'} (${info.vcodec}${info.acodec?' + '+info.acodec:''})`;
-      $('#cvText').textContent='Se crea una copia en MP4 para poder verla y editarla. El archivo original no se modifica.';
+    const sizeMB=(S.file&&S.file.size||0)/1048576;
+    let mode, src;
+    // 1) Copia rápida a MP4 (sin recodificar)
+    if(!opt.noRemux&&COPY_V.includes(info.vcodec)&&(native||sizeMB<=WASM_REMUX_MAX_MB)){
+      $('#cvTitle').textContent=`Preparando ${ext||'el video'} (copia rápida)`;
+      $('#cvText').textContent=`El video ya viene en ${info.vcodec.toUpperCase()}: se pasa a MP4 sin recodificar, así que no pierde calidad y tarda poco.`;
       const t0=performance.now();
-      blob=await ffProxy(info,p=>{
-        $('#cvBar').style.width=(p*100).toFixed(1)+'%';
-        const el=(performance.now()-t0)/1000, rem=p>0.02?el*(1-p)/p:0;
-        $('#cvPct').textContent=`${Math.floor(p*100)} %`+(rem?` · faltan ~${rem>90?Math.round(rem/60)+' min':Math.round(rem)+' s'}`:'');
-      });
-      glog(`conversión lista en ${Math.round((performance.now()-t0)/1000)} s (${(blob.size/1048576).toFixed(1)} MB)`);
+      try{
+        await ffRemux(info);
+        glog(`copia a MP4 lista en ${((performance.now()-t0)/1000).toFixed(1)} s`);
+        mode='remux';
+        src=native?'/ff/stream/remux.mp4?v='+Date.now():URL.createObjectURL(new Blob([await ffRead('remux.mp4')],{type:'video/mp4'}));
+      }catch(e){if(convCancelled||/cancelado/.test(e.message))throw e;glog('la copia rápida no funcionó: '+e.message)}
+    }else if(!opt.noRemux&&COPY_V.includes(info.vcodec)){
+      glog(`archivo de ${sizeMB.toFixed(0)} MB: en el navegador la copia rápida se limita a ${WASM_REMUX_MAX_MB} MB`);
+    }
+    if(!mode){
+      const long=info.dur>FF_LITE_SEC;
+      if(long){
+        $('#cvTitle').textContent='Modo solo subtítulos';
+        $('#cvText').textContent=`Video largo (${fmt(info.dur).replace(/\.\d$/,'')}) que el teléfono no reproduce. Para no esperar una conversión, verás una imagen fija y los subtítulos se generarán directo del audio original.`;
+        $('#cvPct').textContent='Preparando…';
+        src=URL.createObjectURL(new Blob([await ffPlaceholder(info)],{type:'video/mp4'})); mode='placeholder';
+      }else{
+        $('#cvTitle').textContent=`Convirtiendo ${ext||'el video'} (${info.vcodec}${info.acodec?' + '+info.acodec:''})`;
+        $('#cvText').textContent='Se crea una copia en MP4 para poder verla y editarla. El archivo original no se modifica.';
+        const t0=performance.now();
+        const blob=await ffProxy(info,p=>{
+          $('#cvBar').style.width=(p*100).toFixed(1)+'%';
+          const el=(performance.now()-t0)/1000, rem=p>0.02?el*(1-p)/p:0;
+          $('#cvPct').textContent=`${Math.floor(p*100)} %`+(rem?` · faltan ~${rem>90?Math.round(rem/60)+' min':Math.round(rem)+' s'}`:'');
+        });
+        glog(`conversión lista en ${Math.round((performance.now()-t0)/1000)} s (${(blob.size/1048576).toFixed(1)} MB)`);
+        src=URL.createObjectURL(new Blob([blob],{type:'video/mp4'})); mode='convert';
+      }
     }
     if(convCancelled)return;
-    S.compat={placeholder:long,lite:false,info:{format:info.format,vcodec:info.vcodec,acodec:info.acodec,w:info.w,h:info.h}};
-    if(long)S.afterOpen='subs';
+    S.compat={mode,placeholder:mode==='placeholder',lite:false,info:{format:info.format,vcodec:info.vcodec,acodec:info.acodec,w:info.w,h:info.h,dur:info.dur}};
+    if(mode==='placeholder')S.afterOpen='subs';
     S.loading='proxy';
-    if(S.url)URL.revokeObjectURL(S.url);
-    S.url=URL.createObjectURL(new Blob([blob],{type:'video/mp4'}));
-    video.src=S.url; video.load();
+    if(S.url&&S.url.startsWith('blob:'))URL.revokeObjectURL(S.url);
+    S.url=src; video.src=S.url; video.load();
     C.classList.add('hidden');
   }catch(e){
     if(convCancelled)return;
@@ -1242,6 +1277,13 @@ async function openCompat(why){
     glog('no se pudo abrir: '+m+(ffLog.length?'\nFFmpeg: '+ffLog.slice(-5).join(' | '):''));
     toast(m==='FFMPEG_NO'?'Este formato necesita el convertidor, que viene en la app Android y en la versión de GitHub Pages.':'No se pudo abrir el video: '+m);
   }
+}
+/* Si la copia rápida no se puede reproducir (p. ej. HEVC en un teléfono sin decodificador), se usa el plan B */
+function compatFallback(why){
+  if(!(S.loading==='proxy'&&S.compat&&S.compat.mode==='remux'))return false;
+  glog('la copia rápida no se reproduce ('+why+') → conversión o modo solo subtítulos');
+  const info=S.compat.info; S.compat=null; S.loading='direct'; openCompat(why,{noRemux:true,info});
+  return true;
 }
 /* Audio por partes con el FFmpeg NATIVO de Android (cualquier formato, rápido) */
 class NativeFfSource{

@@ -22,6 +22,8 @@ import androidx.webkit.WebViewAssetLoader
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
+import java.io.InputStream
+import java.io.RandomAccessFile
 import java.io.ByteArrayInputStream
 
 /**
@@ -118,7 +120,16 @@ class MainActivity : ComponentActivity() {
         web.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
                 view: WebView, request: WebResourceRequest
-            ): WebResourceResponse? = loader.shouldInterceptRequest(request.url)
+            ): WebResourceResponse? {
+                val u = request.url
+                // Copia MP4 hecha por FFmpeg nativo: se sirve por partes (Range) para que el
+                // reproductor la lea sin cargarla completa en memoria
+                if (u.host == HOST && (u.path ?: "").startsWith("/ff/stream/")) {
+                    val name = (u.lastPathSegment ?: return null).replace("..", "")
+                    return streamFile(File(NativeFfmpeg.outDir(this@MainActivity), name), request.requestHeaders)
+                }
+                return loader.shouldInterceptRequest(u)
+            }
 
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val url = request.url
@@ -341,5 +352,42 @@ class MainActivity : ComponentActivity() {
                 }
             } catch (e: Exception) { null }
         }
+    }
+
+    private fun streamFile(f: File, headers: Map<String, String>?): WebResourceResponse? {
+        if (!f.exists()) return null
+        val len = f.length()
+        val range = headers?.entries?.firstOrNull { it.key.equals("Range", true) }?.value
+        var start = 0L
+        var end = len - 1
+        if (range != null) {
+            Regex("bytes=(\\d*)-(\\d*)").find(range)?.let { m ->
+                if (m.groupValues[1].isNotEmpty()) start = m.groupValues[1].toLong()
+                if (m.groupValues[2].isNotEmpty()) end = minOf(m.groupValues[2].toLong(), len - 1)
+            }
+        }
+        if (start > end || start >= len) start = 0
+        val count = end - start + 1
+        val raf = RandomAccessFile(f, "r").apply { seek(start) }
+        val body = object : InputStream() {
+            var left = count
+            override fun read(): Int {
+                if (left <= 0) return -1
+                val b = raf.read(); if (b >= 0) left--; return b
+            }
+            override fun read(b: ByteArray, off: Int, l: Int): Int {
+                if (left <= 0) return -1
+                val n = raf.read(b, off, minOf(l.toLong(), left).toInt()); if (n > 0) left -= n; return n
+            }
+            override fun close() { raf.close() }
+        }
+        val h = mutableMapOf(
+            "Accept-Ranges" to "bytes", "Content-Length" to count.toString(),
+            "Cache-Control" to "no-store", "Cross-Origin-Resource-Policy" to "same-origin"
+        )
+        return if (range != null) {
+            h["Content-Range"] = "bytes $start-$end/$len"
+            WebResourceResponse("video/mp4", null, 206, "Partial Content", h, body)
+        } else WebResourceResponse("video/mp4", null, 200, "OK", h, body)
     }
 }
