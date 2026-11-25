@@ -577,7 +577,8 @@ video.addEventListener('loadedmetadata',async()=>{
     if(compatFallback('sin imagen'))return;
     toast('Ese archivo no tiene imagen de video.');return;
   }
-  clearTimeout(loadWatch); S.loading=null;
+  clearTimeout(loadWatch); S.loading=null; $('#convert').classList.add('hidden');
+  glog(`reproductor listo: ${video.videoWidth}×${video.videoHeight}, ${fmt(video.duration)}`);
   let d=video.duration;
   if(!isFinite(d)){ // algunos WebM no traen duración
     video.currentTime=1e7; await new Promise(r=>video.addEventListener('durationchange',r,{once:true})); d=video.duration; video.currentTime=0;
@@ -1296,7 +1297,11 @@ async function openCompat(why,opt={}){
     S.loading='proxy';
     if(S.url&&S.url.startsWith('blob:'))URL.revokeObjectURL(S.url);
     S.url=src; video.src=S.url; video.load();
-    C.classList.add('hidden');
+    $('#cvTitle').textContent='Abriendo el video…'; $('#cvText').textContent='Ya está listo; el reproductor lo está cargando.'; $('#cvPct').textContent=''; $('#cvBar').style.width='100%';
+    glog(`abriendo resultado (${mode}): ${String(src).slice(0,40)}`);
+    clearTimeout(loadWatch);
+    loadWatch=setTimeout(()=>{if(S.loading!=='proxy')return;glog('el reproductor no respondió en 15 s');
+      if(!compatFallback('el reproductor no respondió')){S.loading=null;C.classList.add('hidden');$('#empty').classList.remove('hidden');toast('El reproductor no pudo abrir el video. Revisa «Probar la app» en la pestaña Subtítulos.')}},15000);
   }catch(e){
     if(convCancelled)return;
     S.loading=null; C.classList.add('hidden'); $('#empty').classList.remove('hidden');
@@ -1308,6 +1313,14 @@ async function openCompat(why,opt={}){
 /* Si la copia rápida no se puede reproducir (p. ej. HEVC en un teléfono sin decodificador), se usa el plan B */
 function compatFallback(why){
   if(!(S.loading==='proxy'&&S.compat&&S.compat.mode==='remux'))return false;
+  if(String(S.url).startsWith('/ff/stream/')&&!S.compat.triedBlob&&(S.file&&S.file.size||0)<400*1048576){
+    S.compat.triedBlob=true; glog('la copia por partes no se reprodujo ('+why+') → se carga completa');
+    fetch('/ff/out/remux.mp4',{cache:'no-store'}).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.blob()}).then(b=>{
+      S.url=URL.createObjectURL(new Blob([b],{type:'video/mp4'}));video.src=S.url;video.load();
+      clearTimeout(loadWatch);loadWatch=setTimeout(()=>{if(S.loading==='proxy')compatFallback('tampoco respondió completa')},15000);
+    }).catch(e=>{glog('no se pudo cargar completa: '+e.message);compatFallback(why)});
+    return true;
+  }
   glog('la copia rápida no se reproduce ('+why+') → conversión o modo solo subtítulos');
   const info=S.compat.info; S.compat=null; S.loading='direct'; openCompat(why,{noRemux:true,info});
   return true;
@@ -1727,6 +1740,34 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
   }
 }
 
+/* --- Diagnóstico: revisa cada pieza y deja el resultado en «Detalles técnicos» --- */
+const APP_BUILD='build-9';
+async function runDiag(){
+  const D=$('details'); if(D)D.open=true;
+  const ok=(b,t)=>glog((b?'✔ ':'✘ ')+t);
+  glog('===== Diagnóstico Rótulo '+APP_BUILD+' =====');
+  glog(`navegador: ${navigator.userAgent.replace(/^Mozilla\/5\.0 /,'')}`);
+  glog(`núcleos: ${navigator.hardwareConcurrency||'?'} · memoria: ${navigator.deviceMemory||'?'} GB · aislado: ${!!self.crossOriginIsolated}`);
+  ok(!!A(),'app Android (puente nativo)');
+  if(A()){
+    try{ok(true,'motor de descargas: '+(andr('dlEngine')||'?'))}catch(e){}
+    ok(!!andr('ffReady'),'FFmpeg nativo instalado'+(S.ffNativeBroken?' (marcado como bloqueado en este uso)':''));
+    if(andr('ffReady')){try{const id=andr('ffStart',JSON.stringify(['-hide_banner','-version']));const lines=[];const rc=await ffPoll(id,l=>lines.push(l));ok(rc===0,'FFmpeg nativo ejecuta: '+(lines[0]||'sin salida')+' (código '+rc+')')}catch(e){ok(false,'FFmpeg nativo ejecuta: '+e.message)}}
+  }
+  if(S.file){
+    glog(`video: ${S.name} · ${(S.file.size/1048576).toFixed(1)} MB · tipo "${S.file.type||'?'}" · modo ${S.compat?S.compat.mode:'directo'} · cargando=${S.loading||'no'}`);
+    glog(`reproductor: estado ${video.readyState} · ${video.videoWidth}×${video.videoHeight} · duración ${fmt(video.duration||0)} · error ${video.error?video.error.code+' '+(video.error.message||''):'ninguno'} · fuente ${String(video.currentSrc||'').slice(0,40)}`);
+    if(A()){try{const j=await (await fetch('/ff/probe',{cache:'no-store'})).json();ok(!!j.ok,'Android lee el video: '+JSON.stringify(j))}catch(e){ok(false,'Android lee el video: '+e.message)}}
+    if(nativeAudioOk()){try{const r=await fetch('/pcm/open/0',{cache:'no-store'});const j=await r.json();ok(!!j.ok,'lector de audio de Android: '+JSON.stringify(j));fetch('/pcm/close').catch(()=>{})}catch(e){ok(false,'lector de audio de Android: '+e.message)}}
+  }else glog('(no hay video abierto: abre el video con problemas y vuelve a tocar «Probar la app»)');
+  try{const t=await resolveTjs();ok(true,'motor de IA: '+(t.wasm?'incluido en la app':'desde internet (CDN)'))}catch(e){ok(false,'motor de IA: '+e.message)}
+  try{const r=await fetch('https://huggingface.co/onnx-community/whisper-base/resolve/main/config.json',{cache:'no-store'});ok(r.ok,'descarga de modelos (Hugging Face): HTTP '+r.status)}catch(e){ok(false,'descarga de modelos (Hugging Face): '+e.message)}
+  if(aiWorker)ok(true,'motor de IA ya estaba activo');
+  else try{await new Promise((res,rej)=>{getWorker().then(w=>{const t=setTimeout(()=>rej(new Error('sin respuesta en 20 s')),20000);const h=e=>{if(e.data&&e.data.type==='info'){clearTimeout(t);w.removeEventListener('message',h);res()}};w.addEventListener('message',h)}).catch(rej)});ok(true,'motor de IA arranca')}catch(e){ok(false,'motor de IA arranca: '+e.message)}
+  glog('===== fin del diagnóstico: toca «Copiar detalles» y pégalo en el chat =====');
+  toast('Diagnóstico listo: toca «Copiar detalles»');
+}
+
 /* --- .srt --- */
 function srtTime(t){const ms=Math.max(0,Math.round(t*1000)),p=(n,l=2)=>String(n).padStart(l,'0');return `${p(Math.floor(ms/3600000))}:${p(Math.floor(ms/60000)%60)}:${p(Math.floor(ms/1000)%60)},${p(ms%1000,3)}`}
 function buildSrt(){return S.subs.map((c,i)=>`${i+1}\n${srtTime(c.start)} --> ${srtTime(c.end)}\n${c.text}\n`).join('\n')}
@@ -1756,7 +1797,8 @@ function srng(label,k,min,max,step,mul,unit){
 const LIST_MAX=400;
 function renderSubsTab(){
   const P=$('#subsPanel'); if(!P)return;
-  if(!S.url){P.innerHTML=`<div class="gen"><h3>Subtítulos automáticos</h3><p class="note">Abre un video: Rótulo escucha lo que se dice, escribe los subtítulos y los traduce al español, todo dentro de tu dispositivo.</p><button class="btn primary" data-sa="open">Elegir video</button></div>`;return}
+  if(!S.url){P.innerHTML=`<div class="gen"><h3>Subtítulos automáticos</h3><p class="note">Abre un video: Rótulo escucha lo que se dice, escribe los subtítulos y los traduce al español, todo dentro de tu dispositivo.</p><button class="btn primary" data-sa="open">Elegir video</button>
+    <details style="margin-top:10px"><summary class="note" style="cursor:pointer;margin:0">Detalles técnicos</summary><pre id="genLog" style="white-space:pre-wrap;font-size:11px;color:var(--muted);max-height:180px;overflow:auto">${esc(diag.join('\n'))}</pre><button class="btn sm" data-sa="copylog">Copiar detalles</button> <button class="btn sm" data-sa="diag">Probar la app</button></details></div>`;return}
   const o=S.genOpts, g=S.gen, isAndroid=!!A(), prog=!g.running?loadProgress():null;
   let h=`<div class="gen"><h3>Subtítulos automáticos</h3>`;
   if(g.running){
@@ -1786,7 +1828,7 @@ function renderSubsTab(){
       if(d.detected)h+=`<p class="note" style="margin-top:6px">${d.detectFail?'No se pudo detectar el idioma y se usó inglés. ':''}Si el idioma no es el correcto, elígelo arriba y genera de nuevo.</p>`;
     }
   }
-  h+=`<details style="margin-top:10px"><summary class="note" style="cursor:pointer;margin:0">Detalles técnicos</summary><pre id="genLog" style="white-space:pre-wrap;font-size:11px;color:var(--muted);max-height:180px;overflow:auto">${esc(diag.join('\n'))}</pre><button class="btn sm" data-sa="copylog">Copiar detalles</button></details>`;
+  h+=`<details style="margin-top:10px"><summary class="note" style="cursor:pointer;margin:0">Detalles técnicos</summary><pre id="genLog" style="white-space:pre-wrap;font-size:11px;color:var(--muted);max-height:180px;overflow:auto">${esc(diag.join('\n'))}</pre><button class="btn sm" data-sa="copylog">Copiar detalles</button> <button class="btn sm" data-sa="diag">Probar la app</button></details>`;
   h+=`</div>`;
   if(S.subs.length&&S.subStyle&&!g.running){
     const st=S.subStyle, long=S.dur>20*60;
@@ -1829,6 +1871,7 @@ SP.addEventListener('click',e=>{
   if(a==='cancel'){killWorker();return}
   if(a==='srt'){saveSrt();return}
   if(a==='battery'){andr('openBatterySettings');return}
+  if(a==='diag'){runDiag();return}
   if(a==='copylog'){const t=diag.join('\n');(navigator.clipboard&&navigator.clipboard.writeText(t).then(()=>toast('Detalles copiados'),()=>toast('No se pudo copiar; selecciónalos y cópialos a mano')))||toast('Selecciona el texto y cópialo');return}
   if(a==='clear'){S.subs=[];clearProgress();commit();refreshAll();toast('Subtítulos borrados (puedes deshacer)');return}
   if(b.dataset.gq){S.genOpts.q=b.dataset.gq;renderSubsTab();return}
