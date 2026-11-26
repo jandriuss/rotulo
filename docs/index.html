@@ -114,6 +114,7 @@ textarea{resize:vertical;min-height:58px;font-size:16px}
 .seg button{background:none;border:0;padding:8px 12px;min-width:40px;min-height:38px;display:flex;align-items:center;justify-content:center}
 .seg button+button{border-left:1px solid var(--line)}
 .seg button.on{background:var(--accent);color:var(--accent-ink)}
+.fld>.seg button{flex:1}
 .seg svg{width:16px;height:16px}
 .sw{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .sw button{width:28px;height:28px;border-radius:50%;border:2px solid var(--line)}
@@ -1410,8 +1411,10 @@ class FFmpegSource{
    ============================================================ */
 const TJS_VERSION='3.8.1';
 const TJS_CDN=`https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TJS_VERSION}`;
-const ASR_MODELS={base:'onnx-community/whisper-base',small:'onnx-community/whisper-small'};
+const ASR_MODELS={base:'onnx-community/whisper-base',small:'onnx-community/whisper-small',max:'onnx-community/whisper-small'};
 const MT_MODEL='Xenova/opus-mt-en-es';
+const NLLB_MODEL='Xenova/nllb-200-distilled-600M';   // traductor directo de ~200 idiomas (uso no comercial)
+const NLLB_CODES={en:'eng_Latn',ja:'jpn_Jpan',ko:'kor_Hang',zh:'zho_Hans',fr:'fra_Latn',de:'deu_Latn',it:'ita_Latn',pt:'por_Latn',ru:'rus_Cyrl',ar:'arb_Arab',hi:'hin_Deva',th:'tha_Thai',vi:'vie_Latn',id:'ind_Latn',tr:'tur_Latn',pl:'pol_Latn',nl:'nld_Latn',uk:'ukr_Cyrl',sv:'swe_Latn',he:'heb_Hebr',fa:'pes_Arab',ms:'zsm_Latn',tl:'tgl_Latn',el:'ell_Grek',cs:'ces_Latn',ro:'ron_Latn',hu:'hun_Latn',da:'dan_Latn',fi:'fin_Latn',no:'nob_Latn',ca:'cat_Latn',bn:'ben_Beng',ta:'tam_Taml',ur:'urd_Arab'};
 const SR=16000;
 const WEB_MAX_SEC=30*60;            // en el navegador el audio completo va a memoria: límite prudente
 const LANGS={auto:'Detectar idioma',en:'Inglés',pt:'Portugués',fr:'Francés',it:'Italiano',de:'Alemán',ja:'Japonés',ko:'Coreano',zh:'Chino',ru:'Ruso',ar:'Árabe',hi:'Hindi',nl:'Neerlandés',tr:'Turco',pl:'Polaco',uk:'Ucraniano',es:'Español'};
@@ -1458,7 +1461,7 @@ const iso = !!self.crossOriginIsolated;
 const threads = (${forceSingle} || !iso) ? 1 : Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1));
 env.backends.onnx.wasm.numThreads = threads;
 postMessage({ type:'info', text:'motor listo · hilos=' + threads + ' · aislado=' + iso + ' · núcleos=' + (navigator.hardwareConcurrency||'?') });
-let asr = null, asrId = null, mt = null;
+let asr = null, asrId = null, mt = null, nllb = null;
 const prog = stage => d => { if (d && d.status) postMessage({ type:'load', stage, status:d.status, file:d.file||'', loaded:d.loaded||0, total:d.total||0 }); };
 async function getAsr(id){
   if (asrId !== id) { asr = null; asrId = null; asr = await pipeline('automatic-speech-recognition', id, { dtype:'q8', device:'wasm', progress_callback: prog('asr') }); asrId = id; }
@@ -1493,6 +1496,18 @@ self.onmessage = async e => {
       if (m.language) opts.language = m.language;
       const out = await p(m.audio, opts);
       postMessage({ type:'asr', id:m.id, text: out.text || '', chunks: (out.chunks || []).map(c => ({ text:c.text, timestamp:c.timestamp })) });
+    } else if (m.type === 'free') {
+      if (m.what === 'mt' && mt) { try { await mt.dispose(); } catch (_) {} mt = null; }
+      if (m.what === 'nllb' && nllb) { try { await nllb.dispose(); } catch (_) {} nllb = null; }
+      postMessage({ type:'free', id:m.id });
+    } else if (m.type === 'nllb') {
+      if (!nllb) nllb = await pipeline('translation', '${NLLB_MODEL}', { dtype:'q8', device:'wasm', progress_callback: prog('nllb') });
+      const res = [];
+      for (const t of m.texts) {   // de a una frase: más estable que en lote
+        const o = await nllb(t, { src_lang: m.src, tgt_lang: 'spa_Latn', max_new_tokens: 160 });
+        const a = Array.isArray(o) ? o[0] : o; res.push((a && a.translation_text) || '');
+      }
+      postMessage({ type:'nllb', id:m.id, texts: res });
     } else if (m.type === 'mt') {
       if (!mt) mt = await pipeline('translation', '${MT_MODEL}', { dtype:'q8', device:'wasm', progress_callback: prog('mt') });
       const out = await mt(m.texts);
@@ -1553,7 +1568,7 @@ function onModelProgress(m){
   if(m.status==='done'&&m.file&&dlFiles[m.stage+m.file]){const f=dlFiles[m.stage+m.file];f.loaded=f.total}
   const fs=Object.entries(dlFiles).filter(([k])=>k.startsWith(m.stage)).map(([,v])=>v);
   const tot=fs.reduce((a,b)=>a+(b.total||0),0), ld=fs.reduce((a,b)=>a+(b.loaded||0),0);
-  const what=m.stage==='asr'?'el modelo de voz':'el modelo de traducción', pc=tot>0?Math.floor(ld/tot*100):0;
+  const what=m.stage==='asr'?'el modelo de voz':m.stage==='nllb'?'el traductor «Máxima»':'el modelo de traducción', pc=tot>0?Math.floor(ld/tot*100):0;
   // velocidad de descarga (promedio de los últimos segundos)
   const now=Date.now(); if(now-dlSpeed.t>=3000){if(dlSpeed.t&&ld>=dlSpeed.b)dlSpeed.v=(ld-dlSpeed.b)/((now-dlSpeed.t)/1000);dlSpeed.t=now;dlSpeed.b=ld}
   const step=Math.floor(pc/10)*10, key=m.stage;
@@ -1655,7 +1670,7 @@ function dedupeLoops(t){
 function groupSentences(list){
   const out=[];let cur=null;
   for(const c of list){
-    if(cur&&!/[.!?…]["'»”)]?$/.test(cur.text)&&c.start-cur.end<1.5&&(c.end-cur.start)<12&&(cur.text.length+c.text.length)<200){
+    if(cur&&!/[.!?…。！？]["'»”」』)]?$/.test(cur.text)&&c.start-cur.end<1.5&&(c.end-cur.start)<12&&(cur.text.length+c.text.length)<200){
       cur.text+=' '+c.text;cur.end=c.end;continue}
     if(cur)out.push(cur); cur=Object.assign({},c);
   }
@@ -1704,6 +1719,107 @@ function finalize(list){
   return out.map(c=>({id:c.id||uid(),start:+c.start.toFixed(2),end:+Math.min(S.dur,c.end).toFixed(2),text:c.text,orig:c.orig}));
 }
 
+async function openAudio(startSec){
+  const chain=[];
+  if(nativeAudioOk())chain.push(()=>new NativeSource());
+  if(nativeAudioOk()&&nativeFF())chain.push(()=>new NativeFfSource());
+  if(!S.compat&&S.dur<=WEB_MAX_SEC)chain.push(()=>new MemorySource());
+  chain.push(()=>new FFmpegSource());
+  let lastErr=null;
+  for(const mk of chain){
+    const s=mk();
+    try{const start=await s.open(startSec);glog('audio: '+s.label);return {src:s,start}}
+    catch(e){lastErr=e;glog(`audio: ${s.label} no sirvió (${e.message})`);try{s.close()}catch(_){}}
+  }
+  throw (lastErr&&lastErr.message==='FFMPEG_NO'&&S.dur>WEB_MAX_SEC)?new Error('LARGO'):(lastErr||new Error('no se pudo leer el audio'));
+}
+
+/* --- Comparar «Precisa» y «Máxima» con 2 minutos de la película --- */
+S.cmp=null;
+function renderCmp(){
+  const c=S.cmp;
+  let h=`<details class="sect" style="margin-top:12px" ${c?'open':''}><summary style="cursor:pointer"><b>¿Vale la pena «Máxima»? Compárala con «Precisa»</b></summary>
+    <p class="note">Traduce unos 2 minutos con voz de la mitad de este video de las dos formas y las muestra lado a lado, para que decidas con tu propia película. La primera vez descarga los modelos (más de 1 GB en total, mejor con wifi).</p>`;
+  if(!c||(!c.running&&!c.rows))h+=`<button class="btn" data-sa="cmp">Comparar</button>`;
+  if(c&&c.running)h+=`<div class="stage" id="cmpMsg">${esc(c.msg||'')}</div><div class="dl" id="genDl"></div><button class="btn sm" data-sa="cmpstop">Detener</button>`;
+  if(c&&c.err)h+=`<div class="err">${esc(c.err)}</div>`;
+  if(c&&c.rows&&c.rows.length){
+    h+=`<p class="note">Idioma: ${esc(langName(c.lang))}. Lee las dos columnas y fíjate cuál se entiende mejor como conversación.</p>`;
+    for(const r of c.rows)h+=`<div style="border-top:1px solid var(--line);padding:8px 0"><div class="note" style="margin:0 0 4px">${fmt(r.t).replace(/\.\d$/,'')}${r.orig?' · original: '+esc(r.orig):''}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><div><b>Precisa</b><br>${esc(r.a||'—')}</div><div><b>Máxima</b><br>${esc(r.b||'—')}</div></div></div>`;
+    if(!c.running)h+=`<div class="row" style="margin-top:8px"><button class="btn sm" data-sa="cmp">Comparar otra vez</button><button class="btn sm danger" data-sa="cmpdel">No me convence: borrar «Máxima» (libera ~1 GB)</button></div>`;
+  }
+  return h+`</details>`;
+}
+function cmpMsg(m){if(S.cmp)S.cmp.msg=m;const el=$('#cmpMsg');if(el)el.textContent=m;else renderSubsTab()}
+async function compareQuality(){
+  if(!S.file||S.gen.running||(S.cmp&&S.cmp.running))return;
+  S.cmp={running:true,msg:'Preparando…',rows:[]};renderSubsTab();
+  glog('===== comparación «Precisa» vs «Máxima» =====');
+  let src=null;
+  try{
+    const model=ASR_MODELS.small;
+    src=(await openAudio(0)).src;
+    // idioma: el elegido, el ya detectado, o se detecta escuchando 3 partes
+    let lang=S.genOpts.src!=='auto'?S.genOpts.src:(S.gen.done&&S.gen.done.lang)||null;
+    if(!lang){
+      cmpMsg('Cargando el modelo de voz y detectando el idioma…');
+      const sum={};let n=0;
+      for(const f of [0.3,0.5,0.7,0.4,0.6]){
+        if(n>=3)break;
+        const at=S.dur*f;if(src.seek)await src.seek(at);const a=await src.read(25*SR);
+        if(!a.length||rms(a)<0.01)continue;
+        const r=await aiCall({type:'detect',model,audio:a},[a.buffer]);
+        if(r.top){n++;r.top.forEach(([k,v])=>sum[k]=(sum[k]||0)+v)}
+        if(!src.seek)break;
+      }
+      const t=topLangs(sum,n);lang=t[0]?t[0][0]:'en';glog('comparación: idioma '+fmtTop(t));
+    }
+    S.cmp.lang=lang;
+    if(lang==='es')throw new Error('El video está en español: no hay nada que traducir para comparar.');
+    const nsrc=NLLB_CODES[lang];
+    if(!nsrc)throw new Error(`«Máxima» todavía no tiene el idioma ${langName(lang)}.`);
+    const start=src.seek?await src.seek(S.dur*0.4):0;
+    const win=new Windower(src,start), parts=[];
+    cmpMsg('Buscando 2 minutos con voz…');
+    for(let k=0;k<12&&parts.length<4;k++){const w=await win.next();if(!w)break;if(rms(w.audio)>=0.01)parts.push(w)}
+    if(!parts.length)throw new Error('No se encontró voz en la mitad del video para comparar.');
+    const stop=()=>{if(!S.cmp||!S.cmp.running)throw new Error('detenido')};
+    // 1) «Precisa»: la IA de voz traduce al inglés y luego inglés → español
+    await aiCall({type:'free',what:'nllb'});
+    for(const [i,w] of parts.entries()){
+      stop();cmpMsg(`«Precisa»: parte ${i+1} de ${parts.length}…`);
+      const ra=await aiCall({type:'asr',model,task:lang==='en'?'transcribe':'translate',language:lang,audio:w.audio.slice()});
+      const ca=groupSentences(chunksToCues(ra,w.start,w.audio.length/SR));
+      if(ca.length){const t=await aiCall({type:'mt',texts:ca.map(c=>c.text)});ca.forEach((c,j)=>c.text=cleanText(t.texts[j])||c.text)}
+      S.cmp.rows.push({t:w.start,a:ca.map(c=>c.text).join(' '),b:'',orig:''});renderSubsTab();
+    }
+    // 2) «Máxima»: escribe en el idioma original y lo traduce directo al español
+    await aiCall({type:'free',what:'mt'});
+    for(const [i,w] of parts.entries()){
+      stop();cmpMsg(`«Máxima»: parte ${i+1} de ${parts.length} (la primera vez descarga el traductor)…`);
+      const rb=await aiCall({type:'asr',model,task:'transcribe',language:lang,audio:w.audio.slice()});
+      const cb=groupSentences(chunksToCues(rb,w.start,w.audio.length/SR));
+      let tb=[];if(cb.length)tb=(await aiCall({type:'nllb',src:nsrc,texts:cb.map(c=>c.text)})).texts.map(cleanText);
+      const row=S.cmp.rows[i];row.orig=cb.map(c=>c.text).join(' ');row.b=tb.join(' ');
+      glog(`comparación ${fmt(w.start)}\n  Precisa: ${row.a}\n  Máxima: ${row.b}`);renderSubsTab();
+    }
+    if(!S.cmp.rows.length)throw new Error('No se encontró voz en la mitad del video para comparar.');
+    S.cmp.running=false;
+  }catch(e){
+    if(S.cmp){S.cmp.running=false;if(!/detenido|cancelado/.test(e.message))S.cmp.err=friendlyErr?friendlyErr(e):e.message}
+    glog('comparación: '+e.message);
+  }finally{try{src&&src.close()}catch(_){}}
+  renderSubsTab();
+}
+async function deleteMaxModel(){
+  let n=0;
+  try{for(const k of await caches.keys()){const c=await caches.open(k);for(const r of await c.keys())if(/nllb-200/.test(r.url)){await c.delete(r);n++}}}catch(e){}
+  killWorker(true);
+  if(S.genOpts.q==='max')S.genOpts.q='small';
+  S.cmp=null;toast(n?'Se borró el traductor «Máxima»':'No había archivos de «Máxima» guardados');renderSubsTab();
+}
+
 /* --- Progreso guardado (pausar / continuar) --- */
 const progKey=()=>'rotulo:prog:'+store.key();
 function saveProgress(){try{localStorage.setItem(progKey(),JSON.stringify({v:1,opts:S.genOpts,lang:S.gen.lang,cursor:S.gen.cursor,subs:S.subs}))}catch(e){}}
@@ -1744,6 +1860,7 @@ function friendlyErr(e){
   return 'No se pudieron generar los subtítulos. Detalle: '+m;
 }
 async function generateSubs(mode){            // mode: 'new' | 'resume'
+  if(S.cmp&&S.cmp.running){toast('Espera a que termine la comparación (o detenla)');return}
   if(S.gen.running||!S.url)return;
   const prog=mode==='resume'?loadProgress():null;
   if(mode!=='resume'&&S.subs.length&&!S.gen.confirm){S.gen.confirm=true;renderSubsTab();return}
@@ -1762,18 +1879,7 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
   let src=null,lastNotify=0,paused=false;
   const notify=()=>{const now=Date.now();if(now-lastNotify<3000)return;lastNotify=now;andr('workUpdate',`${fmt(S.gen.cursor).replace(/\.\d$/,'')} de ${fmt(S.dur).replace(/\.\d$/,'')} · ${S.subs.length} subtítulos`,Math.round((S.gen.p||0)*100))};
   try{
-    const chain=[];
-    if(nativeAudioOk())chain.push(()=>new NativeSource());
-    if(nativeAudioOk()&&nativeFF())chain.push(()=>new NativeFfSource());
-    if(!S.compat&&S.dur<=WEB_MAX_SEC)chain.push(()=>new MemorySource());
-    chain.push(()=>new FFmpegSource());
-    let realStart=startSec,lastErr=null;
-    for(const mk of chain){
-      const s=mk();
-      try{realStart=await s.open(startSec);src=s;glog('audio: '+s.label);break}
-      catch(e){lastErr=e;glog(`audio: ${s.label} no sirvió (${e.message})`);try{s.close()}catch(_){}}
-    }
-    if(!src)throw (lastErr&&lastErr.message==='FFMPEG_NO'&&S.dur>WEB_MAX_SEC)?new Error('LARGO'):(lastErr||new Error('no se pudo leer el audio'));
+    const oa=await openAudio(startSec); src=oa.src; let realStart=oa.start;
     const win=new Windower(src,realStart);
     const model=ASR_MODELS[o.q]||ASR_MODELS.base;
     let lang=S.gen.lang||(o.src==='auto'?null:o.src);
@@ -1808,9 +1914,14 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
     }
     S.gen.lang=lang;
     const same=o.tgt==='same';
-    let task, needMT;
-    const setLang=l=>{lang=l;S.gen.lang=l;task=(same||l==='es'||l==='en')?'transcribe':'translate';needMT=!same&&l!=='es';glog(`tarea: ${task}${needMT?' + traducción en→es':''} (${langName(l)})`)};
+    let task, needMT, nllbSrc=null;
+    const setLang=l=>{lang=l;S.gen.lang=l;
+      nllbSrc=(o.q==='max'&&!same&&l!=='es'&&NLLB_CODES[l])||null;
+      if(nllbSrc){task='transcribe';needMT=false}       // «Máxima»: se escribe en el idioma original y se traduce directo al español
+      else{task=(same||l==='es'||l==='en')?'transcribe':'translate';needMT=!same&&l!=='es'}
+      glog(`tarea: ${task}${nllbSrc?' + traducción directa '+nllbSrc+'→español':needMT?' + traducción en→es':''} (${langName(l)})`)};
     setLang(lang);
+    await aiCall({type:'free',what:o.q==='max'?'mt':'nllb'});   // un solo traductor en memoria a la vez
     const recheck=o.src==='auto'; let voicedN=0, doubt=null, redone=false;
     let n=0;
     while(true){
@@ -1830,11 +1941,16 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
             else doubt=null;
           }catch(e){if(/cancelado/.test(e.message))throw e}
         }
-        setGen(`${needMT?'Escuchando y traduciendo':'Escuchando'} (${langName(lang).toLowerCase()})…`);
+        setGen(`${needMT||nllbSrc?'Escuchando y traduciendo':'Escuchando'} (${langName(lang).toLowerCase()})…`);
         const t1=performance.now();
         const r=await aiCall({type:'asr',model,task,language:lang,audio:w.audio},[w.audio.buffer]);
         let cues=chunksToCues(r,w.start,wd);
-        if(needMT&&cues.length){
+        if(nllbSrc&&cues.length){
+          cues=groupSentences(cues);
+          const r2=await aiCall({type:'nllb',src:nllbSrc,texts:cues.map(c=>c.text)});
+          cues.forEach((c,j)=>{const tr=cleanText(r2.texts[j]);c.orig=c.text;if(tr)c.text=tr});
+        }
+        else if(needMT&&cues.length){
           cues=groupSentences(cues);   // se traduce la frase completa, no pedazos sueltos
           const r2=await aiCall({type:'mt',texts:cues.map(c=>c.text)});
           cues.forEach((c,j)=>{const tr=cleanText(r2.texts[j]);c.orig=c.text;if(tr)c.text=tr});
@@ -1878,7 +1994,7 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
 }
 
 /* --- Diagnóstico: revisa cada pieza y deja el resultado en «Detalles técnicos» --- */
-const APP_BUILD='build-14';
+const APP_BUILD='build-15';
 async function runDiag(){
   const D=$('details'); if(D)D.open=true;
   const ok=(b,t)=>glog((b?'✔ ':'✘ ')+t);
@@ -1967,8 +2083,8 @@ function renderSubsTab(){
     ${S.compat&&S.compat.placeholder?'<div class="warn" style="margin-bottom:10px">Modo solo subtítulos: este formato no se puede reproducir en el teléfono, así que verás una imagen fija. Los subtítulos salen del audio original; al terminar usa «Descargar .srt» y ábrelo con la película en VLC o MX Player.</div>':''}
     <div class="row"><label class="fld grow"><span>Idioma del video</span><select data-go="src">${Object.entries(LANGS).map(([k,v])=>`<option value="${k}" ${k===o.src?'selected':''}>${v}</option>`).join('')}</select></label>
     <label class="fld grow"><span>Subtítulos en</span><select data-go="tgt"><option value="es" ${o.tgt==='es'?'selected':''}>Español (traducir)</option><option value="same" ${o.tgt==='same'?'selected':''}>El idioma del video (sin traducir)</option></select></label></div>
-    <div class="fld"><span>Precisión</span><div class="seg"><button data-gq="base" class="${o.q==='base'?'on':''}">Rápida</button><button data-gq="small" class="${o.q==='small'?'on':''}">Precisa</button></div></div>
-    <p class="note">La primera vez se descargan los modelos de IA: unos 150 MB en «Rápida» o unos 350 MB en «Precisa» (aproximado; usa wifi). Después quedan guardados en el dispositivo.</p>`;
+    <div class="fld"><span>Precisión</span><div class="seg"><button data-gq="base" class="${o.q==='base'?'on':''}">Rápida</button><button data-gq="small" class="${o.q==='small'?'on':''}">Precisa</button><button data-gq="max" class="${o.q==='max'?'on':''}">Máxima</button></div></div>
+    <p class="note">La primera vez se descargan los modelos de IA: unos 150 MB en «Rápida», unos 350 MB en «Precisa» y algo más de 1 GB en «Máxima» (aproximado; usa wifi). Después quedan guardados en el dispositivo. «Máxima» escribe en el idioma original y lo traduce directo al español, sin pasar por inglés; es la más lenta.</p>`;
     if(false)h+=`<div class="warn">Este video dura ${fmt(S.dur).replace(/\.\d$/,'')}. ${isAndroid?'Ábrelo con el botón «Abrir video» de la app para que pueda leer el audio por partes.':`En el navegador el máximo es ${WEB_MAX_SEC/60} minutos; para películas usa la app Android.`}</div>`;
     if(prog&&prog.cursor<S.dur-1){
       h+=`<div class="warn">Quedó un proceso en pausa en ${fmt(prog.cursor).replace(/\.\d$/,'')} de ${fmt(S.dur).replace(/\.\d$/,'')} (${prog.subs.length} subtítulos).</div>
@@ -1979,11 +2095,12 @@ function renderSubsTab(){
     if(g.error)h+=`<div class="err">${esc(g.error)}</div>`;
     if(g.done){
       const d=g.done;
-      h+=`<div class="ok">✓ ${d.n} subtítulos en ${d.secs>=120?Math.round(d.secs/60)+' min':d.secs+' s'}${d.detected?` · idioma detectado: ${esc(d.top?fmtTop(d.top):langName(d.lang))}`:''}${d.changed?' (corregido durante el proceso)':''}${d.needMT&&d.task==='translate'?' · traducido pasando por inglés':''}.</div>`;
+      h+=`<div class="ok">✓ ${d.n} subtítulos en ${d.secs>=120?Math.round(d.secs/60)+' min':d.secs+' s'}${d.detected?` · idioma detectado: ${esc(d.top?fmtTop(d.top):langName(d.lang))}`:''}${d.changed?' (corregido durante el proceso)':''}${d.needMT&&d.task==='translate'?' · traducido pasando por inglés':''}${S.genOpts.q==='max'&&d.task==='transcribe'&&d.lang!=='es'?' · traducción directa al español':''}.</div>`;
       if(HARD_LANGS.includes(d.lang)&&S.genOpts.q==='base')h+=`<p class="note" style="margin-top:6px">Si la traducción quedó floja, genera de nuevo con precisión «Precisa»: con ${esc(langName(d.lang).toLowerCase())} la diferencia es grande.</p>`;
       if(d.detected)h+=`<p class="note" style="margin-top:6px">${d.detectFail?'No se pudo detectar el idioma y se usó inglés. ':''}Si el idioma no es el correcto, elígelo arriba y genera de nuevo.</p>`;
     }
   }
+  if(!g.running)h+=renderCmp();
   h+=`<details style="margin-top:10px"><summary class="note" style="cursor:pointer;margin:0">Detalles técnicos</summary><pre id="genLog" style="white-space:pre-wrap;font-size:11px;color:var(--muted);max-height:180px;overflow:auto">${esc(diag.join('\n'))}</pre><button class="btn sm" data-sa="copylog">Copiar detalles</button> <button class="btn sm" data-sa="diag">Probar la app</button></details>`;
   h+=`</div>`;
   if(S.subs.length&&S.subStyle&&!g.running){
@@ -2027,6 +2144,9 @@ SP.addEventListener('click',e=>{
   if(a==='nogen'){S.gen.confirm=false;renderSubsTab();return}
   if(a==='cancel'){killWorker();return}
   if(a==='srt'){saveSrt();return}
+  if(a==='cmp'){compareQuality();return}
+  if(a==='cmpstop'){if(S.cmp)S.cmp.running=false;killWorker(true,'detenido');return}
+  if(a==='cmpdel'){deleteMaxModel();return}
   if(a==='play'){playWithSubs();return}
   if(a==='battery'){andr('openBatterySettings');return}
   if(a==='diag'){runDiag();return}
