@@ -1643,11 +1643,29 @@ class Windower{
 /* --- Limpieza y armado de subtítulos --- */
 const JUNK=/^[\s\-–—.,!?¿¡…♪♫*]*$|^\s*[\[(][^\])]*[\])]\s*$/;
 function cleanText(t){return String(t||'').replace(/\s+/g,' ').replace(/^\s*[-–—]\s*/,'').trim()}
+/* Frases que la IA de voz «inventa» en silencios o ruido (créditos de YouTube, despedidas), no diálogo real */
+const HALLU=/^(thank you (so much |very much )?for watching|thanks for watching|please (like and )?subscribe|subscribe to|subtitles? (by|made by|created by)|.*amara\.org|.*\bwww\.|see you (in the )?next (time|video)|gracias por ver|suscr[ií]bete|subt[ií]tulos (realizados )?por)\b/i;
+/* «I'm sorry. I'm sorry. I'm sorry.» → «I'm sorry.»: la IA a veces repite en bucle */
+function dedupeLoops(t){
+  let x=t.replace(/(\b.{2,60}?[.!?,]?)(?:\s+\1){2,}/gi,'$1');
+  const w=x.split(' '); if(w.length>=8){const u=new Set(w.map(z=>z.toLowerCase().replace(/[^\p{L}\p{N}]/gu,'')));if(u.size<=2)x=w.slice(0,3).join(' ')}
+  return x;
+}
+/* Une los pedazos de una misma frase en un solo subtítulo antes de traducir, para que la traducción tenga sentido completo */
+function groupSentences(list){
+  const out=[];let cur=null;
+  for(const c of list){
+    if(cur&&!/[.!?…]["'»”)]?$/.test(cur.text)&&c.start-cur.end<1.5&&(c.end-cur.start)<12&&(cur.text.length+c.text.length)<200){
+      cur.text+=' '+c.text;cur.end=c.end;continue}
+    if(cur)out.push(cur); cur=Object.assign({},c);
+  }
+  if(cur)out.push(cur); return out;
+}
 function chunksToCues(r,off,dur){
   const out=[];
   const chunks=(r.chunks&&r.chunks.length)?r.chunks:(r.text?[{text:r.text,timestamp:[0,null]}]:[]);
   for(const c of chunks){
-    const text=cleanText(c.text); if(!text||JUNK.test(text))continue;
+    const text=dedupeLoops(cleanText(c.text)); if(!text||JUNK.test(text)||HALLU.test(text))continue;
     let [a,b]=c.timestamp||[0,null];
     a=clamp(+a||0,0,dur);
     // sin hora final: se estima por velocidad de lectura para no quedarse en pantalla durante silencios
@@ -1817,6 +1835,7 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
         const r=await aiCall({type:'asr',model,task,language:lang,audio:w.audio},[w.audio.buffer]);
         let cues=chunksToCues(r,w.start,wd);
         if(needMT&&cues.length){
+          cues=groupSentences(cues);   // se traduce la frase completa, no pedazos sueltos
           const r2=await aiCall({type:'mt',texts:cues.map(c=>c.text)});
           cues.forEach((c,j)=>{const tr=cleanText(r2.texts[j]);c.orig=c.text;if(tr)c.text=tr});
         }
@@ -1859,7 +1878,7 @@ async function generateSubs(mode){            // mode: 'new' | 'resume'
 }
 
 /* --- Diagnóstico: revisa cada pieza y deja el resultado en «Detalles técnicos» --- */
-const APP_BUILD='build-13';
+const APP_BUILD='build-14';
 async function runDiag(){
   const D=$('details'); if(D)D.open=true;
   const ok=(b,t)=>glog((b?'✔ ':'✘ ')+t);
